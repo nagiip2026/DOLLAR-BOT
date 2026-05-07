@@ -165,8 +165,8 @@ ANALYZE_ALL_PAIRS = False # False মানে তালিকাভুক্ত
 # =================================================================================
 
 # --- সিগন্যাল ইমেজ কনফিগারেশন (আপডেট) ---
-TELEGRAM_BOT_TOKEN = "8765107924:AAGVJuWokFHKV6dNbNLD5cepSJzoCIiXmFg"
-TELEGRAM_CHAT_ID = "-1003588291058"
+TELEGRAM_BOT_TOKEN = "8641469184:AAEwkmTGd1odlmYN1Uhw3cVsCwrYUpDWoxI"
+TELEGRAM_CHAT_ID = "-1003782757055"
 SIGNAL_USERNAME = "@nagiip_star"  # নতুন ভেরিয়েবল
 SEND_PHOTO_WITH_SIGNAL = False # False: কাস্টম ফটো, True: মার্কেট চার্ট
 CHART_BACKGROUND_IMAGE_PATH = "" # খালি রাখলে সলিড ব্ল্যাক ব্যাকগ্রাউন্ড হবে
@@ -177,7 +177,7 @@ TELEGRAM_API_ID = 34436072
 TELEGRAM_API_HASH = 'a0b9111474837c610d2da60ef36ccebb'
 TELEGRAM_PHONE_NUMBER = '+252639005850'
 TELEGRAM_SOURCE_CHANNEL = "NAGIIP_STAR_X"  # সোর্স চ্যানেল ইউজারনেম (এখানে @ ছাড়া)
-TELEGRAM_TARGET_CHANNELS = [-1003588291058]  # টার্গেট চ্যানেল আইডি (লিস্ট)
+TELEGRAM_TARGET_CHANNELS = [-1003782757055]  # টার্গেট চ্যানেল আইডি (লিস্ট)
 PREMIUM_EMOJI_MODE = False  # ডিফল্ট OFF
 PREMIUM_EMOJI_TARGET = True  # নতুন: টার্গেট চ্যানেলে প্রিমিয়াম ইমোজি পাঠানো ON/OFF
 # =======================================================================
@@ -224,7 +224,7 @@ WATERMARK_ON = True
 WATERMARK_TEXT = "NAGIIP DOLLAR x AI BOT"
 SIGNAL_HEADER_TEXT = "NAGIIP DOLLAR x AI BOT"
 CHART_HEADER_TEXT = "NAGIIP DOLLAR x AI BOT"
-RESULT_FOOTER_TEXT = "𒆜•——‼️ M | A | F | I | A ‼️——•𒆜"
+RESULT_FOOTER_TEXT = "𒆜•——‼️ N | A | G | I | I | P ‼️——•𒆜"
 
 # ================= নতুন অ্যাডভান্সড ফিচার সেটিংস =================
 PARABOLIC_SAR_LINES = False  # প্যারাবলিক SAR লাইন ON/OFF
@@ -747,14 +747,14 @@ def get_statistics(results_list=None):
 
 # ================= টেলিগ্রাম ফাংশন (আপডেট) =================
 
-async def send_telegram_photo_or_chart(caption, pair=None, candles=None, result=None):
+async def send_telegram_photo_or_chart(caption, pair=None, candles=None, result=None, signal_direction=None, entry_time=None):
     """Sends a photo (custom or chart) with a caption to Telegram."""
     global SEND_PHOTO_WITH_SIGNAL, CHART_BACKGROUND_IMAGE_PATH
 
     try:
         if SEND_PHOTO_WITH_SIGNAL and pair and candles:
             # Send Market Chart Image
-            image_buffer = create_chart_image(pair, candles, result=result, caption=caption)
+            image_buffer = create_chart_image(pair, candles, result=result, caption=caption, signal_direction=signal_direction, entry_time=entry_time)
 
             if not image_buffer:
                 print(rainbow_text("❌ 𝙲𝚑𝚊𝚛𝚝 𝚒𝚖𝚊𝚐𝚎 𝚌𝚛𝚎𝚊𝚝𝚒𝚘𝚗 𝚏𝚊𝚒𝚕𝚎𝚍. 𝚂𝚎𝚗𝚍𝚒𝚗𝚐 𝚊𝚜 𝚝𝚎𝚡𝚝 𝚖𝚎𝚜𝚜𝚊𝚐𝚎."))
@@ -801,27 +801,32 @@ async def send_telegram_photo_or_chart(caption, pair=None, candles=None, result=
         return send_telegram_message(caption)
 
 def send_telegram_message(message):
-    """Sends a text message to Telegram (synchronous using requests/session)."""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': True
-        }
-
-        response = session.post(url, data=payload, timeout=10)
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        print(rainbow_text(f"𝙵𝚊𝚒𝚕𝚎𝚍 𝚝𝚘 𝚜𝚎𝚗𝚍 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚖𝚎𝚜𝚜𝚊𝚐𝚎: {e}"))
+    """Sends a text message to Telegram with automatic retry on failure."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True
+    }
+    for attempt in range(3):
         try:
-            alt_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            response = requests.post(alt_url, data=payload, timeout=15, verify=False)
-            return response.status_code == 200
-        except:
-            return False
+            response = session.post(url, data=payload, timeout=15)
+            if response.status_code == 200:
+                return True
+            # Telegram returned an error - log it but retry
+            print(rainbow_text(f"𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙷𝚃𝚃𝙿 {response.status_code}: {response.text[:120]}"))
+        except Exception as e:
+            print(rainbow_text(f"𝚂𝚎𝚗𝚍 𝚊𝚝𝚝𝚎𝚖𝚙𝚝 {attempt+1}/3 𝚏𝚊𝚒𝚕𝚎𝚍: {e}"))
+        if attempt < 2:
+            time.sleep(2)
+    # Final fallback: raw requests (no session)
+    try:
+        response = requests.post(url, data=payload, timeout=20, verify=False)
+        return response.status_code == 200
+    except Exception as e:
+        print(rainbow_text(f"𝙵𝚒𝚗𝚊𝚕 𝚏𝚊𝚕𝚕𝚋𝚊𝚌𝚔 𝚏𝚊𝚒𝚕𝚎𝚍: {e}"))
+        return False
 
 # ================= নতুন টেকনিক্যাল ইন্ডিকেটর ফাংশন =================
 
@@ -1297,7 +1302,7 @@ def draw_dashed_line(draw, start, end, color, width=1, dash_length=5):
         draw.line([dash_start, dash_end], fill=color, width=width)
         drawn_length += dash_length * 2
 
-def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str = "") -> BytesIO:
+def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str = "", signal_direction: str = None, entry_time: str = None) -> BytesIO:
     global MARK_RESULT_CANDLE, SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SHOW_GRID_LINES, SHOW_PRICE_SCALE, TREND_LINES, BACKGROUND_TRANSPARENCY, CHART_TEXT_GLOW, WATERMARK_ON, WATERMARK_TEXT, CHART_HEADER_TEXT
     global PARABOLIC_SAR_LINES, GAP_DRAWING, REVERSE_AREA_DRAWING, FVG_GAP_DRAW, CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, EMA_LINE_CHART, SUPERTREND_CHART, SNR_LINES
     
@@ -1346,7 +1351,11 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
     # --- Header config ---
     is_result     = result is not None
     tf_label      = f"M{TIMEFRAME//60}" if TIMEFRAME >= 60 else f"S{TIMEFRAME}"
-    sig_text      = candles[-1].get('signal', 'CALL') if candles else 'CALL'
+    # Use explicitly passed direction first; fall back to last candle's signal
+    if signal_direction is not None:
+        sig_text = signal_direction.upper()
+    else:
+        sig_text = candles[-1].get('signal', 'CALL') if candles else 'CALL'
     sig_color     = GREEN if sig_text == 'CALL' else RED
     sig_direction = sig_text  # 'CALL' or 'PUT'
 
@@ -1393,11 +1402,14 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
             sv_color      = (255, 240, 180)
             status_dot_color = (220, 180, 30)
 
-    # Time from last candle
-    try:
-        candle_time = candles[-1]['dt'].strftime("%H:%M") if candles and candles[-1].get('dt') else datetime.now(UTC_PLUS_6).strftime("%H:%M")
-    except Exception:
-        candle_time = datetime.now(UTC_PLUS_6).strftime("%H:%M")
+    # Time: use explicitly passed entry_time (matches caption) or fall back to last candle
+    if entry_time is not None:
+        candle_time = entry_time
+    else:
+        try:
+            candle_time = candles[-1]['dt'].strftime("%H:%M") if candles and candles[-1].get('dt') else datetime.now(UTC_PLUS_6).strftime("%H:%M")
+        except Exception:
+            candle_time = datetime.now(UTC_PLUS_6).strftime("%H:%M")
 
     # Today's win/loss stats
     _today_iso  = datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
@@ -2240,7 +2252,7 @@ async def process_signal(client, pair, direction, data):
 🌐𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖: {SIGNAL_USERNAME}"""
 
         # প্রাথমিক সিগন্যাল পাঠানোর লজিক
-        await send_telegram_photo_or_chart(msg, pair, chart_candles)
+        await send_telegram_photo_or_chart(msg, pair, chart_candles, signal_direction=direction.upper(), entry_time=formatted_time)
 
         # ট্রেড ডেটা তৈরি, কিন্তু JSON এ সেভ হবে না।
         trade_data = {
@@ -2331,7 +2343,7 @@ async def process_signal(client, pair, direction, data):
                 "⚖️⚖️⚖️ 𝗕𝗥𝗘𝗔𝗞-𝗘𝗩𝗘𝗡 ⚖️⚖️⚖️"
             )
 
-            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even')
+            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even', signal_direction=direction.upper(), entry_time=formatted_time)
             _ready_next_signal_now()
             return
 
@@ -2357,7 +2369,7 @@ async def process_signal(client, pair, direction, data):
                 "✅✅✅ 𝗦𝗨𝗥𝗘𝗦𝗛𝗢𝗧 ✅✅✅"
             )
 
-            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit')
+            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit', signal_direction=direction.upper(), entry_time=formatted_time)
             _ready_next_signal_now()
 
             trade_results[-1]['result'] = 'Profit'
@@ -2435,7 +2447,7 @@ async def process_signal(client, pair, direction, data):
                         f"⚖️⚖️⚖️ {mtg_symbol} 𝗕𝗥𝗘𝗔𝗞-𝗘𝗩𝗘𝗡 ⚖️⚖️⚖️"
                     )
 
-                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even')
+                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even', signal_direction=direction.upper(), entry_time=formatted_time)
                     
                     print(rainbow_text(f"𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎 𝚝𝚛𝚊𝚍𝚎 𝚏𝚘𝚛 {clean_asset} 𝚊𝚝 {formatted_time} 𝚎𝚗𝚍𝚎𝚍 𝚒𝚗 𝙱𝚛𝚎𝚊𝚔-𝚎𝚟𝚎𝚗 (𝚂𝚝𝚎𝙥 {martingale_step})."))
                     break
@@ -2451,7 +2463,7 @@ async def process_signal(client, pair, direction, data):
                         direction_label=("CALL" if direction == "call" else "PUT")
                     )
 
-                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit')
+                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit', signal_direction=direction.upper(), entry_time=formatted_time)
 
                     trade_results[-1]['result'] = 'Profit'
                     trade_results[-1]['profit'] = 10.0  # ফিক্সড ভ্যালু
@@ -2470,7 +2482,7 @@ async def process_signal(client, pair, direction, data):
                             direction_label=("CALL" if direction == "call" else "PUT")
                         )
 
-                        await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Loss')
+                        await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Loss', signal_direction=direction.upper(), entry_time=formatted_time)
 
                         trade_results[-1]['result'] = 'Loss'
                         trade_results[-1]['profit'] = -7.0  # ফিক্সড ভ্যালু
@@ -3044,13 +3056,18 @@ async def get_profitable_pairs(client, min_profit=70):
 # ================= send_partial_results ফাংশন (নতুন স্টাইল) =================
 
 def send_partial_results():
-    """Send partial results in new styled format"""
+    """Send partial results in styled format matching user design"""
     global last_partial_results_time
 
     last_partial_results_time = int(time.time())
 
     bd_time    = datetime.now(pytz.timezone('Asia/Dhaka'))
-    today_date = bd_time.strftime("%Y • %m • %d")
+    # Format date as 𝟸𝟶𝟸𝟼.𝟶𝟻.𝟶𝟼 using mathematical bold digits
+    _digits = {"0":"𝟶","1":"𝟷","2":"𝟸","3":"𝟹","4":"𝟺","5":"𝟻","6":"𝟼","7":"𝟽","8":"𝟾","9":"𝟿"}
+    def _bold_num(s):
+        return "".join(_digits.get(c, c) for c in s)
+    raw_date   = bd_time.strftime("%Y.%m.%d")
+    bold_date  = _bold_num(raw_date)
 
     confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss', 'Break-even']]
     today_trades     = [r for r in confirmed_trades if r.get('date') == bd_time.date().isoformat()]
@@ -3058,47 +3075,47 @@ def send_partial_results():
     wins   = sum(1 for t in today_trades if t.get('result') == 'Profit')
     losses = sum(1 for t in today_trades if t.get('result') == 'Loss')
     total  = wins + losses
-    acc    = f"{wins/total*100:.1f}%" if total > 0 else "0%"
-
-    SEP = "┣━━━━━━━━━━━━━━━━━━━━━━━┫"
-    TOP = "╔═╺───────◇───────╺═╗"
-    BTM = "╚═╺───────◆───────╺═╝"
+    acc_val = f"{wins/total*100:.0f}%" if total > 0 else "0%"
 
     tf_str = f"M{TIMEFRAME//60}" if TIMEFRAME >= 60 else f"S{TIMEFRAME}"
 
-    msg  = f"<b>{TOP}\n"
-    msg += "        🚀 🆑🄎🄕🄙🄎🄎🄘 🄕🄎🄗🄎🄕🄙\n"
-    msg += f"{BTM}\n\n"
-    msg += f"        📆 {today_date}\n\n"
-    msg += f"{SEP}\n"
+    DIVIDER   = "━━━━━━━━━・━━━━━━━━━"
+    HDR_TOP   = "=========== Result'S==========="
+    HDR_BOT   = "==============================="
+
+    msg  = f"<b>{HDR_TOP}\n\n"
+    msg += f"{DIVIDER}\n"
+    msg += f"          📆 - {bold_date}          \n"
+    msg += f"{DIVIDER}\n\n"
 
     if not today_trades:
-        msg += "        ——— NO SIGNALS YET ———\n"
+        msg += "     ——— NO SIGNALS YET ———\n\n"
     else:
         for trade in today_trades[-25:]:
             t_time    = trade.get('signal_time', '00:00')
-            pair_disp = trade.get('pair_display', trade.get('pair', '')).replace('_otc', '-OTC').replace('_OTC', '-OTC').upper()
+            pair_raw  = trade.get('pair_display', trade.get('pair', ''))
+            pair_disp = pair_raw.replace('_otc', '-OTC').replace('_OTC', '-OTC').upper()
             direction = 'PUT' if trade.get('direction', 'call') == 'put' else 'CALL'
             r         = trade.get('result')
             mtg       = trade.get('martingale_step', 0)
             if r == 'Profit':
                 icon = ("✅¹" if mtg == 1 else "✅²" if mtg == 2 else "✅³" if mtg == 3 else f"✅{mtg}" if mtg > 0 else "✅")
             elif r == 'Loss':
-                icon = "❌"
+                icon = "❌️"
             else:
                 icon = "⚖️"
             dir_pad = direction.ljust(4)
-            line = f"➤ {tf_str} {pair_disp} {t_time} {dir_pad}  {icon}"
-            msg += f"</b><code>{line}</code><b>\n"
+            # currency pair in monospace bold; rest of line in monospace
+            msg += f"</b><b><code>{tf_str} {pair_disp} {t_time} {dir_pad} {icon}</code></b><b>\n"
 
-    msg += f"{SEP}\n\n"
-    msg += f"🎯 <b>Wins</b>      ➞ {wins}\n"
-    msg += f"❌ <b>Losses</b>    ➞ {losses}\n"
-    msg += f"📈 <b>Accuracy</b> ➞ {acc}\n\n"
-    msg += f"{SEP}\n\n"
-    msg += f"⚙️ <b>Powered By</b> : {CHART_HEADER_TEXT}\n"
-    msg += f"💌 <b>Contact</b> : {SIGNAL_USERNAME}\n\n"
-    msg += f"{BTM}</b>"
+    msg += f"\n{DIVIDER}\n\n"
+    msg += f"🏆 <b>Wins</b>     : {wins}\n"
+    msg += f"❌ <b>Losses</b>  : {losses}\n"
+    msg += f"📈 <b>Accuracy</b>: {acc_val}\n\n"
+    msg += f"{DIVIDER}\n\n"
+    msg += f"🤖 {CHART_HEADER_TEXT}\n"
+    msg += f"💌 {SIGNAL_USERNAME}\n\n"
+    msg += f"{HDR_BOT}</b>"
 
     send_telegram_message(msg)
 
@@ -3237,16 +3254,7 @@ async def trading_bot():
             send_telegram_message(connection_failed_msg)
         return
 
-    # Telegram alert for successful bot start
-    if BOT_ALERT_ON:
-        _now_str = datetime.now(pytz.timezone('Asia/Dhaka')).strftime("%H:%M:%S | %d/%m/%Y")
-        bot_started_msg = (
-            f"<b>╔═╺───────◇───────╺═╗\n🟢 BOT STARTED\n╚═╺───────◆───────╺═╝</b>\n"
-            f"\u2699\ufe0f {CURRENT_STRATEGY}\n"
-            f"\U0001f550 {_now_str}\n"
-            f"\U0001f48c {SIGNAL_USERNAME}"
-        )
-        send_telegram_message(bot_started_msg)
+    pass  # Bot started silently
 
     while bot_running:
         try:
@@ -3349,19 +3357,7 @@ def stop_bot():
     if not bot_running: return
     bot_running = False
     
-    # Telegram alert for bot stop
-    if BOT_ALERT_ON:
-        _today2 = datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
-        _wins2 = sum(1 for r in trade_results if r.get('result') == 'Profit' and r.get('date') == _today2)
-        _losses2 = sum(1 for r in trade_results if r.get('result') == 'Loss' and r.get('date') == _today2)
-        _now_stop = datetime.now(pytz.timezone('Asia/Dhaka')).strftime("%H:%M:%S | %d/%m/%Y")
-        bot_stopped_msg = (
-            f"<b>╔═╺───────◇───────╺═╗\n🔴 BOT STOPPED\n╚═╺───────◆───────╺═╝</b>\n"
-            f"\u2705 Wins: {_wins2}  \u274c Losses: {_losses2}\n"
-            f"\U0001f550 {_now_stop}\n"
-            f"\U0001f48c {SIGNAL_USERNAME}"
-        )
-        send_telegram_message(bot_stopped_msg)
+    pass  # Bot stopped silently
     print(rainbow_text("⏹️ 𝙱𝚘𝚟 𝚜𝚝𝚘𝚙𝚙𝚎𝚍"))
 
 # ================= ম্যানুয়াল রেজাল্ট ফাংশন =================
@@ -3841,7 +3837,7 @@ def settings_menu():
         elif choice == "36":
             PREMIUM_EMOJI_TARGET = not PREMIUM_EMOJI_TARGET
             status = '𝙾𝙽' if PREMIUM_EMOJI_TARGET else '𝙾𝙵𝙵'
-            print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+         �   print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
         elif choice == "37":
             PARABOLIC_SAR_LINES = not PARABOLIC_SAR_LINES
             status = '𝙾𝙽' if PARABOLIC_SAR_LINES else '𝙾𝙵𝙵'
@@ -3987,7 +3983,7 @@ def main_menu():
                 f"✅ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚆𝚒𝚗𝚜: {today_stats['wins']}",
                 f"❌ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙻𝚘𝚜𝚜𝚎𝚜: {today_stats['losses']}",
                 f"📊 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙰𝚌𝚌𝚞𝚛𝚊𝚌𝚢: {today_stats['accuracy']}%",
-                f"⚙️ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎: {MARTINGALE_STEPS} 𝚜𝚝𝚎𝚙(𝚜)",
+                f"⚙️ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎: {MARTINGA�LE_STEPS} 𝚜𝚝𝚎𝚙(𝚜)",
                 f"🖼️ 𝙿𝚑𝚘𝚝𝚘 𝚂𝚎𝚗𝚍: {'𝙼𝚊𝚛𝚔𝚎𝚝 𝙲𝚑𝚊𝚛𝚝' if SEND_PHOTO_WITH_SIGNAL else '𝚃𝚎𝚡𝚝 𝙾𝚗𝚕𝚢'}",
                 f"🌐 𝙿𝚊𝚒𝚛 𝙼𝚘𝚍𝚎: {'𝙲𝚄𝚂𝚃𝙾𝙼 𝙿𝙰𝙸𝚁𝚂 𝙾𝙽𝙻𝚈' if CUSTOM_PAIRS_MODE else ('𝙰𝙻𝙻 𝙿𝙰𝙸𝚁𝚂' if ANALYZE_ALL_PAIRS else '𝙴𝚇𝙲𝙻𝚄𝙳𝙴 𝙾𝚃𝙲 𝙻𝙸𝚂𝚃')}",
                 f"🎯 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {CURRENT_STRATEGY}",
