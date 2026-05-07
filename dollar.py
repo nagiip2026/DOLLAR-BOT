@@ -1352,11 +1352,13 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
 
     if not is_result:
         title_text   = CHART_HEADER_TEXT
-        status_label = "\U0001f4e1 SIGNAL STATUS"
+        status_label = "SIGNAL STATUS"
+        status_icon  = "antenna"
     else:
         first_word   = CHART_HEADER_TEXT.split()[0] if CHART_HEADER_TEXT else "BOT"
         title_text   = first_word + " RESULTS"
-        status_label = "\U0001f3af RESULT"
+        status_label = "RESULT"
+        status_icon  = "target"
 
     if not is_result:
         if sig_direction == "PUT":
@@ -1364,27 +1366,32 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
             strip_fill    = (120, 20, 20)
             strip_outline = (210, 60, 60)
             sv_color      = (255, 230, 230)
+            status_dot_color = (220, 60, 60)
         else:
             status_value  = "BUY"
             strip_fill    = (15, 90, 35)
             strip_outline = (40, 200, 80)
             sv_color      = (220, 255, 225)
+            status_dot_color = (60, 220, 80)
     else:
         if result == "Profit":
-            status_value  = "\u2705 WIN"
+            status_value  = "WIN"
             strip_fill    = (15, 90, 35)
             strip_outline = (40, 200, 80)
-            sv_color      = (200, 255, 210)
+            sv_color      = (100, 255, 140)
+            status_dot_color = (60, 220, 80)
         elif result == "Loss":
-            status_value  = "\u274c LOSS"
+            status_value  = "LOSS"
             strip_fill    = (120, 20, 20)
             strip_outline = (210, 60, 60)
-            sv_color      = (255, 210, 210)
+            sv_color      = (255, 100, 100)
+            status_dot_color = (220, 60, 60)
         else:
-            status_value  = "\u2696\ufe0f BE"
+            status_value  = "BE"
             strip_fill    = (100, 80, 10)
             strip_outline = (210, 180, 30)
             sv_color      = (255, 240, 180)
+            status_dot_color = (220, 180, 30)
 
     # Time from last candle
     try:
@@ -1411,31 +1418,93 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
     ROWS    = 4
     box_h   = PAD_Y + ROWS * ROW_H + (ROWS - 1) * GAP + PAD_Y
 
-    # Measure text
+    # ---- PIL icon helper functions ----
+    def draw_icon_antenna(d, cx, cy, r, col):
+        """📡 satellite dish: circle with cross-hairs + radiating arcs"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(10, 20, 50), outline=col, width=2)
+        d.line([(cx - r + 2, cy), (cx + r - 2, cy)], fill=col, width=1)
+        d.line([(cx, cy - r + 2), (cx, cy + r - 2)], fill=col, width=1)
+        d.arc([cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3], 200, 340, fill=col, width=2)
+
+    def draw_icon_target(d, cx, cy, r, col):
+        """🎯 bullseye target: concentric circles"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
+        d.ellipse([cx - r//2, cy - r//2, cx + r//2, cy + r//2], outline=col, width=2)
+        d.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=col)
+        d.line([(cx - r - 2, cy), (cx - r//2 - 1, cy)], fill=col, width=1)
+        d.line([(cx + r//2 + 1, cy), (cx + r + 2, cy)], fill=col, width=1)
+
+    def draw_icon_barchart(d, x, y, w, h, col):
+        """📊 bar chart: 3 vertical bars of different heights"""
+        bw = max(2, w // 4)
+        heights = [int(h * 0.5), int(h * 0.85), int(h * 0.65)]
+        for i, bh in enumerate(heights):
+            bx = x + i * (bw + 1)
+            d.rectangle([bx, y + h - bh, bx + bw, y + h], fill=col)
+
+    def draw_icon_clock(d, cx, cy, r, col):
+        """🕛 clock face: circle + hour hand (12 pos) + minute hand"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
+        d.line([(cx, cy), (cx, cy - r + 3)], fill=col, width=2)
+        d.line([(cx, cy), (cx + r - 4, cy)], fill=col, width=1)
+
+    def draw_icon_trophy(d, x, y, w, h, col):
+        """🏆 trophy: cup shape"""
+        mid = x + w // 2
+        d.rectangle([x + 2, y, x + w - 2, y + h - 4], outline=col, width=1, fill=(30, 60, 20))
+        d.rectangle([x + 1, y + 1, x + w - 1, y + 3], fill=col)
+        d.line([(mid, y + h - 4), (mid, y + h - 1)], fill=col, width=2)
+        d.line([(x + 1, y + h - 1), (x + w - 1, y + h - 1)], fill=col, width=2)
+
+    def draw_icon_checkmark(d, x, y, s, col):
+        """✅ checkmark inside box"""
+        d.rectangle([x, y, x + s, y + s], outline=col, width=2)
+        d.line([(x + 2, y + s//2), (x + s//2 - 1, y + s - 3)], fill=col, width=2)
+        d.line([(x + s//2 - 1, y + s - 3), (x + s - 2, y + 2)], fill=col, width=2)
+
+    def draw_icon_xmark(d, x, y, s, col):
+        """❌ X mark"""
+        d.line([(x + 1, y + 1), (x + s - 1, y + s - 1)], fill=col, width=2)
+        d.line([(x + s - 1, y + 1), (x + 1, y + s - 1)], fill=col, width=2)
+
+    def draw_icon_trend_up(d, x, y, w, h, col):
+        """📈 upward trend line"""
+        pts = [(x, y + h), (x + w//3, y + h//2), (x + 2*w//3, y + h//4), (x + w, y)]
+        for i in range(len(pts) - 1):
+            d.line([pts[i], pts[i+1]], fill=col, width=2)
+        d.polygon([
+            (x + w - 2, y - 2),
+            (x + w + 3, y + 4),
+            (x + w + 3, y - 5)
+        ], fill=col)
+
+    # ---- Measure text (plain strings, no emoji chars) ----
     title_w  = int(draw.textlength(title_text,  font=font_large))
     slabel_w = int(draw.textlength(f"{status_label}: ", font=font_small))
     svalue_w = int(draw.textlength(status_value, font=font_small))
     tf_tw    = int(draw.textlength(tf_label,    font=font_tiny))
-    pair_tw  = int(draw.textlength(f"\U0001f4ca {pair_display}", font=font_medium))
-    time_tw  = int(draw.textlength(f"\U0001f55b {candle_time}",  font=font_medium))
-    ic_span  = 30  # circle icon + gap
+    pair_tw  = int(draw.textlength(pair_display, font=font_medium))
+    time_tw  = int(draw.textlength(candle_time,  font=font_medium))
+    ICON_SZ  = 14   # standard icon size
+    ic_span  = 30   # circle icon + gap
 
     box_w = max(
         PAD_X + ic_span + title_w + PAD_X,
-        PAD_X + slabel_w + svalue_w + tf_tw + 30 + PAD_X,
-        PAD_X + pair_tw + 12 + time_tw + PAD_X,
-        270
+        PAD_X + 10 + ICON_SZ + 4 + slabel_w + svalue_w + tf_tw + 30 + PAD_X,
+        PAD_X + ICON_SZ + 4 + pair_tw + 18 + ICON_SZ + 4 + time_tw + PAD_X,
+        280
     )
 
     x1, y1 = 10, header_y
     x2, y2 = x1 + box_w, y1 + box_h
 
-    # Plain outer border (no glow, no rounded)
+    # Outer glow border
+    draw.rectangle([x1 - 3, y1 - 3, x2 + 3, y2 + 3], outline=(0, 120, 180), width=1)
     draw.rectangle([x1 - 2, y1 - 2, x2 + 2, y2 + 2], outline=(0, 180, 220), width=2)
     # Main panel background
     draw.rectangle([x1, y1, x2, y2], fill=(8, 14, 32), outline=(0, 195, 235), width=1)
 
-    # ===== ROW 1: circle icon + title =====
+    # ===== ROW 1: crosshair circle icon + title =====
     r1_y  = y1 + PAD_Y
     ic_r  = 10
     ic_cx = x1 + PAD_X + ic_r
@@ -1447,26 +1516,56 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
     draw.line([(ic_cx, ic_cy - cs), (ic_cx, ic_cy + cs)], fill=(0, 200, 230), width=2)
     draw.text((ic_cx + ic_r + 8, r1_y + 2), title_text, fill=(255, 255, 255), font=font_large)
 
-    # ===== ROW 2: status strip (solid coloured rectangle) =====
+    # ===== ROW 2: status strip with drawn icon =====
     r2_y  = r1_y + ROW_H + GAP
     draw.rectangle([x1 + 4, r2_y, x2 - 4, r2_y + ROW_H],
                    fill=strip_fill, outline=strip_outline, width=1)
-    draw.text((x1 + 10, r2_y + 4), f"{status_label}: ", fill=(230, 230, 230), font=font_small)
-    draw.text((x1 + 10 + slabel_w, r2_y + 4), status_value, fill=sv_color, font=font_small)
-    # Timeframe pill
-    pill_x2 = x2 - 8
-    pill_x1 = pill_x2 - tf_tw - 12
-    draw.rectangle([pill_x1, r2_y + 3, pill_x2, r2_y + ROW_H - 3],
+    # Draw 📡 or 🎯 icon
+    icon_cx2 = x1 + 12 + ICON_SZ // 2
+    icon_cy2 = r2_y + ROW_H // 2
+    if status_icon == "antenna":
+        draw_icon_antenna(draw, icon_cx2, icon_cy2, ICON_SZ // 2, status_dot_color)
+    else:
+        draw_icon_target(draw, icon_cx2, icon_cy2, ICON_SZ // 2, status_dot_color)
+    text_x2 = x1 + 12 + ICON_SZ + 4
+    draw.text((text_x2, r2_y + 4), f"{status_label}: ", fill=(230, 230, 230), font=font_small)
+    # Draw result-value with checkmark/X icon for WIN/LOSS
+    val_x = text_x2 + slabel_w
+    if is_result and status_value == "WIN":
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+        sv_w = int(draw.textlength(status_value, font=font_small))
+        draw_icon_checkmark(draw, val_x + sv_w + 3, r2_y + 5, ICON_SZ - 4, sv_color)
+    elif is_result and status_value == "LOSS":
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+        sv_w = int(draw.textlength(status_value, font=font_small))
+        draw_icon_xmark(draw, val_x + sv_w + 3, r2_y + 5, ICON_SZ - 4, sv_color)
+    else:
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+    # Timeframe pill  🕛
+    tf_pill_x2 = x2 - 8
+    tf_pill_x1 = tf_pill_x2 - tf_tw - ICON_SZ - 18
+    draw.rectangle([tf_pill_x1, r2_y + 3, tf_pill_x2, r2_y + ROW_H - 3],
                    fill=(0, 55, 110), outline=(0, 160, 235), width=1)
-    draw.text((pill_x1 + 5, r2_y + 5), tf_label, fill=(200, 235, 255), font=font_tiny)
+    clk_ic_cx = tf_pill_x1 + 6 + ICON_SZ // 2
+    clk_ic_cy = r2_y + ROW_H // 2
+    draw_icon_clock(draw, clk_ic_cx, clk_ic_cy, ICON_SZ // 2 - 1, (150, 210, 255))
+    draw.text((tf_pill_x1 + 6 + ICON_SZ + 2, r2_y + 5), tf_label, fill=(200, 235, 255), font=font_tiny)
 
     # ===== ROW 3: 📊 pair + 🕛 time =====
     r3_y = r2_y + ROW_H + GAP
     draw.rectangle([x1, r3_y, x2, r3_y + ROW_H], fill=(12, 20, 42), outline=(0, 80, 120), width=1)
-    draw.text((x1 + PAD_X, r3_y + 3), f"\U0001f4ca {pair_display}", fill=(180, 220, 255), font=font_medium)
-    clk_str = f"\U0001f55b {candle_time}"
-    clk_tw  = int(draw.textlength(clk_str, font=font_medium))
-    draw.text((x2 - PAD_X - clk_tw, r3_y + 3), clk_str, fill=(150, 210, 255), font=font_medium)
+    # 📊 bar-chart icon before pair
+    bar_x = x1 + PAD_X
+    bar_y = r3_y + 4
+    draw_icon_barchart(draw, bar_x, bar_y, ICON_SZ, ROW_H - 8, (100, 180, 255))
+    draw.text((bar_x + ICON_SZ + 4, r3_y + 3), pair_display, fill=(180, 220, 255), font=font_medium)
+    # 🕛 clock icon before time
+    clk_tw_plain = int(draw.textlength(candle_time, font=font_medium))
+    clk_x = x2 - PAD_X - clk_tw_plain
+    clk_ic_x = clk_x - ICON_SZ - 4
+    clk_cy3  = r3_y + ROW_H // 2
+    draw_icon_clock(draw, clk_ic_x + ICON_SZ // 2, clk_cy3, ICON_SZ // 2 - 1, (150, 210, 255))
+    draw.text((clk_x, r3_y + 3), candle_time, fill=(150, 210, 255), font=font_medium)
 
     # ===== ROW 4: legend (signal) or stats (result) =====
     r4_y = r3_y + ROW_H + GAP
@@ -1487,15 +1586,52 @@ def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str
             draw.text((lx + 10, r4_y + 4), lbl, fill=lcol, font=font_tiny)
             lx += 10 + lw + 8
     else:
+        # 🏆 Wins
         rsx = x1 + PAD_X
-        w_str = f"\U0001f3c6 Wins: {hdr_wins}"
-        draw.text((rsx, r4_y + 4), w_str, fill=(100, 255, 140), font=font_small)
-        rsx += int(draw.textlength(w_str, font=font_small)) + 8
-        l_str = f"\u274c Losses: {hdr_losses}"
-        draw.text((rsx, r4_y + 4), l_str, fill=(255, 100, 100), font=font_small)
-        rsx += int(draw.textlength(l_str, font=font_small)) + 8
-        a_str = f"\U0001f4c8 {hdr_rate}%"
-        draw.text((rsx, r4_y + 4), a_str, fill=(100, 210, 255), font=font_small)
+        draw_icon_trophy(draw, rsx, r4_y + 4, ICON_SZ - 2, ROW_H - 8, (255, 210, 0))
+        rsx += ICON_SZ + 2
+        w_label = f"Wins: {hdr_wins}"
+        draw.text((rsx, r4_y + 4), w_label, fill=(100, 255, 140), font=font_small)
+        rsx += int(draw.textlength(w_label, font=font_small)) + 8
+        # ❌ Losses
+        draw_icon_xmark(draw, rsx, r4_y + 5, ICON_SZ - 4, (255, 80, 80))
+        rsx += ICON_SZ - 2
+        l_label = f"Losses: {hdr_losses}"
+        draw.text((rsx, r4_y + 4), l_label, fill=(255, 100, 100), font=font_small)
+        rsx += int(draw.textlength(l_label, font=font_small)) + 8
+        # 📈 Accuracy
+        draw_icon_trend_up(draw, rsx, r4_y + 5, ICON_SZ - 2, ROW_H - 10, (100, 210, 255))
+        rsx += ICON_SZ + 2
+        a_label = f"{hdr_rate}%"
+        draw.text((rsx, r4_y + 4), a_label, fill=(100, 210, 255), font=font_small)
+
+    # ===== WIN / LOSS big badge (top-right corner, result only) =====
+    if is_result and status_value in ("WIN", "LOSS"):
+        badge_w, badge_h = 120, 46
+        badge_x2 = WIDTH - 12
+        badge_x1 = badge_x2 - badge_w
+        badge_y1 = 10
+        badge_y2 = badge_y1 + badge_h
+        b_fill    = (10, 50, 10)  if status_value == "WIN" else (50, 10, 10)
+        b_outline = (0, 240, 80) if status_value == "WIN" else (240, 50, 50)
+        b_col     = (60, 255, 100) if status_value == "WIN" else (255, 80, 80)
+        # Glow layers
+        for g in range(4, 0, -1):
+            gc = tuple(max(0, c - g * 30) for c in b_outline)
+            draw.rectangle([badge_x1 - g, badge_y1 - g, badge_x2 + g, badge_y2 + g],
+                           outline=gc, width=1)
+        draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2],
+                       fill=b_fill, outline=b_outline, width=3)
+        bv_tw = int(draw.textlength(status_value, font=font_large))
+        bv_tx = badge_x1 + (badge_w - bv_tw - ICON_SZ - 4) // 2
+        bv_ty = badge_y1 + (badge_h - ROW_H) // 2
+        draw.text((bv_tx, bv_ty), status_value, fill=b_col, font=font_large)
+        ic_bx = bv_tx + bv_tw + 4
+        ic_by = bv_ty + 2
+        if status_value == "WIN":
+            draw_icon_checkmark(draw, ic_bx, ic_by, ICON_SZ + 2, b_col)
+        else:
+            draw_icon_xmark(draw, ic_bx, ic_by, ICON_SZ + 2, b_col)
     # --- চার্ট এরিয়া ডিফাইন ---
     CHART_AREA_LEFT = 72         # left margin for price axis
     CHART_AREA_TOP = 65          # top margin
