@@ -3837,7 +3837,7 @@ def settings_menu():
         elif choice == "36":
             PREMIUM_EMOJI_TARGET = not PREMIUM_EMOJI_TARGET
             status = '𝙾𝙽' if PREMIUM_EMOJI_TARGET else '𝙾𝙵𝙵'
-         �   print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+            print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
         elif choice == "37":
             PARABOLIC_SAR_LINES = not PARABOLIC_SAR_LINES
             status = '𝙾𝙽' if PARABOLIC_SAR_LINES else '𝙾𝙵𝙵'
@@ -3983,7 +3983,7 @@ def main_menu():
                 f"✅ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚆𝚒𝚗𝚜: {today_stats['wins']}",
                 f"❌ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙻𝚘𝚜𝚜𝚎𝚜: {today_stats['losses']}",
                 f"📊 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙰𝚌𝚌𝚞𝚛𝚊𝚌𝚢: {today_stats['accuracy']}%",
-                f"⚙️ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎: {MARTINGA�LE_STEPS} 𝚜𝚝𝚎𝚙(𝚜)",
+                f"⚙️ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎: {MARTINGALE_STEPS} 𝚜𝚝𝚎𝚙(𝚜)",
                 f"🖼️ 𝙿𝚑𝚘𝚝𝚘 𝚂𝚎𝚗𝚍: {'𝙼𝚊𝚛𝚔𝚎𝚝 𝙲𝚑𝚊𝚛𝚝' if SEND_PHOTO_WITH_SIGNAL else '𝚃𝚎𝚡𝚝 𝙾𝚗𝚕𝚢'}",
                 f"🌐 𝙿𝚊𝚒𝚛 𝙼𝚘𝚍𝚎: {'𝙲𝚄𝚂𝚃𝙾𝙼 𝙿𝙰𝙸𝚁𝚂 𝙾𝙽𝙻𝚈' if CUSTOM_PAIRS_MODE else ('𝙰𝙻𝙻 𝙿𝙰𝙸𝚁𝚂' if ANALYZE_ALL_PAIRS else '𝙴𝚇𝙲𝙻𝚄𝙳𝙴 𝙾𝚃𝙲 𝙻𝙸𝚂𝚃')}",
                 f"🎯 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {CURRENT_STRATEGY}",
