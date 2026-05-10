@@ -1,0 +1,4837 @@
+import ssl
+import asyncio
+import logging
+import os
+import threading
+import time
+import calendar
+import uuid
+import hashlib
+import random
+from contextlib import redirect_stdout, redirect_stderr
+from datetime import datetime, timedelta, timezone
+import numpy as np
+import requests
+from pyquotex.stable_api import Quotex
+from colorama import init, Fore, Back, Style
+from collections import deque
+import concurrent.futures
+import socket
+import socks
+import urllib3
+from urllib3.util.ssl_ import create_urllib3_context
+import json
+import pytz
+from typing import Dict, List, Any
+from io import BytesIO
+import sys
+
+# --- নতুন লাইব্রেরি যোগ করা হলো ---
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import telegram
+from telegram import constants, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+# --- Telethon লাইব্রেরি যোগ করা হলো ---
+from telethon import TelegramClient, events
+from telethon.tl.types import (
+    MessageEntityCustomEmoji,
+    MessageMediaPhoto,
+    MessageMediaDocument,
+)
+# --- নতুন লাইব্রেরি যোগ করা হলো ---
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Initialize colorama
+init(autoreset=True)
+
+# ================= JSONBin কনফিগারেশন =================
+JSONBIN_URL = "https://api.jsonbin.io/v3/b/6943a228ae596e708fa236e0"
+JSONBIN_API_KEY = "$2a$10$dT2JkC9fV8Q1nG7h5YrZ/u"  # API Key
+
+# ================= ডিভাইস ভেরিফিকেশন =================
+def get_device_id():
+    """ইউনিক ডিভাইস আইডি জেনারেট করে"""  
+    try:
+        # মেশিনের হোস্টনেম এবং ইউজারনেম কম্বিনেশন
+        hostname = socket.gethostname()
+        username = os.getlogin() if hasattr(os, 'getlogin') else os.environ.get('USER', 'unknown')
+        device_string = f"{hostname}_{username}_{sys.platform}"
+        
+        # SHA256 হ্যাশ জেনারেট
+        hash_obj = hashlib.sha256(device_string.encode())
+        device_id = f"DEV-{hash_obj.hexdigest()[:16].upper()}"
+        return device_id
+    except:
+        # Fallback to UUID
+        return f"DEV-{str(uuid.uuid4())[:16].upper()}"
+
+def check_device_access():
+    """ডিভাইস অ্যাকসেস চেক করে JSONBin থেকে"""
+    device_id = get_device_id()
+    
+    try:
+        headers = {
+            "X-Master-Key": JSONBIN_API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.get(JSONBIN_URL, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            users = data.get('record', [])
+            
+            for user in users:
+                if user.get('device_id') == device_id:
+                    # Check if user is allowed
+                    if not user.get('allow_user', False):
+                        return False, device_id, "User not allowed"
+                    
+                    # Check expiration date
+                    valid_date_str = user.get('valid_date')
+                    if valid_date_str:
+                        try:
+                            valid_date = datetime.fromisoformat(valid_date_str.replace('Z', '+00:00'))
+                            current_date = datetime.now(timezone.utc)
+                            
+                            if valid_date > current_date:
+                                return True, device_id, user.get('username', 'User')
+                            else:
+                                return False, device_id, "Subscription expired"
+                        except:
+                            return False, device_id, "Invalid date format"
+                    
+                    return True, device_id, user.get('username', 'User')
+            
+            # Device ID not found
+            return False, device_id, "Device not registered"
+        
+        else:
+            # Server error - try local backup
+            return check_local_access(device_id)
+            
+    except Exception as e:
+        print(f"JSONBin connection error: {e}")
+        # Try local backup
+        return check_local_access(device_id)
+
+def check_local_access(device_id):
+    """লোকাল ব্যাকআপ ফাইল থেকে অ্যাকসেস চেক করে"""
+    try:
+        if os.path.exists("access_backup.json"):
+            with open("access_backup.json", 'r') as f:
+                users = json.load(f)
+                
+            for user in users:
+                if user.get('device_id') == device_id:
+                    if not user.get('allow_user', False):
+                        return False, device_id, "User not allowed"
+                    
+                    valid_date_str = user.get('valid_date')
+                    if valid_date_str:
+                        try:
+                            valid_date = datetime.fromisoformat(valid_date_str.replace('Z', '+00:00'))
+                            current_date = datetime.now(timezone.utc)
+                            
+                            if valid_date > current_date:
+                                return True, device_id, user.get('username', 'User')
+                            else:
+                                return False, device_id, "Subscription expired"
+                        except:
+                            return False, device_id, "Invalid date format"
+                    
+                    return True, device_id, user.get('username', 'User')
+    except:
+        pass
+    
+    return False, device_id, "No access found"
+
+# ================= নতুন কনফিগারেশন: বাদ দিতে হবে যে OTC পেয়ারগুলো =================
+USER_EXCLUDE_LIST = [
+    "EURUSD_otc", "EURGBP_otc", "GBPJPY_otc", "CADJPY_otc", "USDJPY_otc",
+    "CADCHF_otc", "USDCHF_otc", "EURAUD_otc", "AUDCAD_otc", "GBPCAD_otc",
+    "USDCAD_otc", "AUDJPY_otc", "GBPAUD_otc", "EURCHF_otc", "GBPCHF_otc",
+    "AUDCHF_otc", "AUDUSD_otc", "EURJPY_otc"
+]
+
+OTC_PAIRS_TO_EXCLUDE = set()
+for p in USER_EXCLUDE_LIST:
+    OTC_PAIRS_TO_EXCLUDE.add(p.lower())
+    OTC_PAIRS_TO_EXCLUDE.add(p.upper().replace('_OTC', '-OTC').replace('_otc', '-OTC'))
+    OTC_PAIRS_TO_EXCLUDE.add(p.upper().replace('-OTC', '_OTC'))
+
+ANALYZE_ALL_PAIRS = False # False মানে তালিকাভুক্ত OTC পেয়ারগুলো বাদ দেওয়া হবে
+# =================================================================================
+
+# --- সিগন্যাল ইমেজ কনফিগারেশন (আপডেট) ---
+TELEGRAM_BOT_TOKEN = "8641469184:AAEwkmTGd1odlmYN1Uhw3cVsCwrYUpDWoxI"
+TELEGRAM_CHAT_ID = "-1003782757055"
+SIGNAL_USERNAME = "@nagiip_star"  # নতুন ভেরিয়েবল
+SEND_PHOTO_WITH_SIGNAL = False # False: কাস্টম ফটো, True: মার্কেট চার্ট
+ADMIN_TELEGRAM_USER_ID = 6187531353  # YOUR Telegram user ID — only this user can control the bot
+CHART_BACKGROUND_IMAGE_PATH = "" # খালি রাখলে সলিড ব্ল্যাক ব্যাকগ্রাউন্ড হবে
+# --- সিগন্যাল ইমেজ কনফিগারেশন (আপডেট) ---
+
+# ================= নতুন টেলিগ্রাম ক্লায়েন্ট কনফিগারেশন =================
+TELEGRAM_API_ID = 34436072
+TELEGRAM_API_HASH = 'a0b9111474837c610d2da60ef36ccebb'
+TELEGRAM_PHONE_NUMBER = '+252639005850'
+TELEGRAM_SOURCE_CHANNEL = "NAGIIP_STAR_X"  # সোর্স চ্যানেল ইউজারনেম (এখানে @ ছাড়া)
+TELEGRAM_TARGET_CHANNELS = [-1003782757055]  # টার্গেট চ্যানেল আইডি (লিস্ট)
+PREMIUM_EMOJI_MODE = False  # ডিফল্ট OFF
+PREMIUM_EMOJI_TARGET = True  # নতুন: টার্গেট চ্যানেলে প্রিমিয়াম ইমোজি পাঠানো ON/OFF
+# =======================================================================
+
+# ================= Signal interval: 60-69 seconds =================
+SIGNAL_INTERVAL_MIN = 60   # 1 minute in seconds
+SIGNAL_INTERVAL_MAX = 69   # 69 seconds
+# Generate random interval between 60-69 seconds
+def get_next_signal_interval():
+    return random.randint(SIGNAL_INTERVAL_MIN, SIGNAL_INTERVAL_MAX)
+# ==================================================================
+
+TIMEFRAME = 60
+CANDLE_FETCH_ATTEMPTS = 3
+MAX_CANDLES = 30 # চার্ট তৈরির জন্য আরও বেশি ক্যান্ডেল
+MARTINGALE_STEPS = 1
+PARTIAL_RESULTS_INTERVAL = 300
+SAVE_FILE = "DOLLAR-ss.json"
+
+# =================== নতুন কাস্টম পেয়ার কনফিগারেশন ===================
+CUSTOM_PAIRS_MODE = False
+CUSTOM_PAIRS_LIST = ["BRLUSD_otc", "USDPKR_otc"]
+# ====================================================================
+
+# =================== নতুন সেটিংস: EMA, RSI, Strategy, Mark Candle ===================
+EMA_PERIOD = 10
+RSI_PERIOD = 14
+CURRENT_STRATEGY = "EMA_RSI"  # ডিফল্ট স্ট্র্যাটেজি
+MARK_RESULT_CANDLE = False  # ডিফল্ট OFF
+MIN_SIGNAL_SCORE = 4  # মিনিমাম স্কোর ফিল্টার
+AVAILABLE_STRATEGIES = ["EMA_RSI", "Trend", "Bollinger", "Support_Resistance", "Trend_Reverse", "Price_Action", "Supertrend", "FVG_Strategy"]  # নতুন স্ট্র্যাটেজি যোগ করা হলো
+# ====================================================================================
+
+# ================= নতুন চার্ট সেটিংস =================
+SUPPORT_RESISTANCE_LINES = False
+MOVING_AVERAGE_LINES = False
+SUPPORT_RESISTANCE_STRATEGY = False
+SHOW_GRID_LINES = True
+SHOW_PRICE_SCALE = True
+TREND_LINES = False
+BACKGROUND_TRANSPARENCY = 50  # 50% transparency (আগের চেয়ে কম)
+CHART_TEXT_GLOW = 0  # গ্লো ইফেক্ট বন্ধ
+WATERMARK_ON = True
+WATERMARK_TEXT = "NAGIIP DOLLAR x AI BOT"
+SIGNAL_HEADER_TEXT = "NAGIIP DOLLAR x AI BOT"
+CHART_HEADER_TEXT = "NAGIIP DOLLAR x AI BOT"
+RESULT_FOOTER_TEXT = "𒆜•——‼️ N | A | G | I | I | P ‼️——•𒆜"
+
+# ================= নতুন অ্যাডভান্সড ফিচার সেটিংস =================
+PARABOLIC_SAR_LINES = False  # প্যারাবলিক SAR লাইন ON/OFF
+GAP_DRAWING = False  # GAP ড্রয়িং ON/OFF (FVG গ্যাপ)
+REVERSE_AREA_DRAWING = False  # রিভার্স এরিয়া ড্রয়িং ON/OFF
+ADVANCED_ANALYSIS = False  # অ্যাডভান্সড অ্যানালাইসিস ON/OFF
+CUSTOM_LINK = ""  # কাস্টম লিংক (খালি থাকলে ডিফল্ট টেক্সট)
+FVG_GAP_DRAW = False  # নতুন: FVG গ্যাপ ড্রয়িং ON/OFF
+BOT_ALERT_ON = True  # নতুন: বট ON/OFF এ্যালার্ট ON/OFF
+CANDLE_UP_COLOR = (0, 229, 200)  # Teal/cyan like reference image
+CANDLE_DOWN_COLOR = (220, 50, 75)  # Bright red like reference image
+EMA_LINE_CHART = False  # নতুন: EMA লাইন চার্ট ON/OFF
+SUPERTREND_CHART = False  # নতুন: সুপারট্রেন্ড চার্ট ON/OFF
+SUPERTREND_STRATEGY = False  # নতুন: সুপারট্রেন্ড স্ট্র্যাটেজি ON/OFF
+SNR_LINES = False  # নতুন: SNR লাইন ON/OFF
+# ================================================================
+
+bot_running = False
+last_signal_time = 0
+trade_results = []
+signal_count = 0
+signal_queue = deque()
+signal_executor = None
+current_signal_task = None
+pending_next_signal   = None    # pre-analyzed next signal while waiting for result
+last_partial_results_time = 0
+start_time = None
+next_signal_interval = get_next_signal_interval()  # Next signal timing
+continuous_analysis = True  # নতুন: ধারাবাহিক অ্যানালাইসিসের জন্য
+
+PAIR_NAMES = {
+    "BRLUSD_otc": "BRL/USD", "USDPKR_otc": "USD/PKR", "USDMXN_otc": "USD/MXN",
+    "USDARS_otc": "USD/ARS", "USDBDT_otc": "USD/BDT", "USDCOP_otc": "USD/COP",
+    "USDINR_otc": "USD/INR", "USDPHP_otc": "USD/PHP", "USDDZD_otc": "USD/DZD",
+    "USDIDR_otc": "USD/IDR", "USDNGN_otc": "USD/NGN", "USDTRY_otc": "USD/TRY",
+    "USDZAR_otc": "USD/ZAR", "USDEGP_otc": "USD/EGP", "CADCHF_otc": "CAD/CHF"
+}
+
+# Custom SSL adapter
+class BangladeshSSLAdapter(requests.adapters.HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super(BangladeshSSLAdapter, self).init_poolmanager(*args, **kwargs)
+
+session = requests.Session()
+session.mount('https://', BangladeshSSLAdapter())
+session.verify = False
+
+bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+UTC_PLUS_6 = pytz.timezone('Asia/Dhaka')
+
+def ts_to_dt(ts):
+    """Convert timestamp to UTC+6 datetime"""
+    if ts is None: return None
+    try:
+        ts = int(ts)
+        if ts > 1_000_000_000_000: ts = ts / 1000
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt_utc.astimezone(UTC_PLUS_6)
+    except:
+        try:
+            dt = datetime.fromisoformat(str(ts))
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(UTC_PLUS_6)
+        except: return None
+
+# ================= Premium Emoji Mapping =================
+PREMIUM_EMOJI_MAP = {
+    "1": 6325797905663791037,
+    "2": 5472416843438246859,
+    "3": 6325437171360600446,
+    "4": 6325717349257187998,
+    "5": 6257905072693318304,
+    "6": 5238052418104610782,
+    "7": 6246738501321102898,
+    "8": 5310278924616356636,
+    "9": 5429381339851796035,
+    "10": 6264785189394717307,
+    "11": 6267086316907795595,
+    "12": 6325667390197600621,
+    "13": 6285048454255220485,
+    "14": 6267068789146260253,
+    "15": 5384513813670279219,
+
+    # ---- Added Emojis ----
+    "16": 6264696987946324240,
+    "17": 5269337080147748373,
+    "18": 5212985021870123409,
+    "19": 5188234920639632382,
+    "20": 5310278924616356636,
+    "21": 5028746137645876535,
+    "22": 5971789963639917544,
+    "23": 5972177777711910216,
+    "24": 5098154789129159560,
+    "25": 6275878213746955453,
+    "26": 5204284487575285695,
+
+    "27": 6285259732286445237,
+    "28": 5215484787325676090,
+    "29": 5208880351690112495,
+    "30": 5208880351690112495,
+    "31": 5208880351690112495,
+    "32": 6116349066650589320,
+    "33": 5372904134817112673,
+    "34": 6118414920150160494,
+    "35": 5231489647946768652,
+
+    "36": 5028325978175177540,
+    "37": 5215484787325676090,
+    "38": 5971936104197131725,
+    "39": 5971936104197131725,
+    "40": 5971936104197131725,
+    "41": 5265204093248364532,
+    "42": 6118414920150160494,
+    "43": 5231489647946768652,
+}
+
+async def convert_to_premium(text, original_entities=None):
+    """Convert regular text to premium emoji text"""
+    if original_entities is None:
+        original_entities = []
+
+    all_entities = list(original_entities)
+    offset = 0
+    converted_text = ""
+
+    for char in text:
+        char_length = len(char.encode('utf-16-le')) // 2
+        if char in PREMIUM_EMOJI_MAP:
+            all_entities.append(MessageEntityCustomEmoji(
+                offset=offset,
+                length=char_length,
+                document_id=PREMIUM_EMOJI_MAP[char]
+            ))
+        converted_text += char
+        offset += char_length
+
+    return converted_text, all_entities
+
+# ================= টেলিগ্রাম ক্লায়েন্ট ফাংশন =================
+
+async def telegram_client_task():
+    """টেলিগ্রাম ক্লায়েন্ট চালু করে সোর্স চ্যানেল থেকে মেসেজ ফরওয়ার্ড করে"""
+    global TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
+    global TELEGRAM_SOURCE_CHANNEL, TELEGRAM_TARGET_CHANNELS, PREMIUM_EMOJI_MODE, PREMIUM_EMOJI_TARGET
+    
+    _session_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'premium_session')
+    client = TelegramClient(_session_abs, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+              print(rainbow_text("⚠️ Telegram not logged in. Please login via Start Bot menu."))
+              await client.disconnect()
+              return
+
+        @client.on(events.NewMessage(chats=TELEGRAM_SOURCE_CHANNEL))
+        async def handler(event):
+            try:
+                print(rainbow_text(f"📨 Received message from @{TELEGRAM_SOURCE_CHANNEL}: {event.raw_text[:50]}..."))
+
+                message_text = event.raw_text
+                original_entities = event.message.entities if event.message.entities else []
+
+                if PREMIUM_EMOJI_MODE:
+                    converted_text, entities = await convert_to_premium(message_text, original_entities)
+                else:
+                    converted_text = message_text
+                    entities = original_entities
+
+                # যদি PREMIUM_EMOJI_TARGET False হয়, তাহলে শুধুমাত্র টার্গেট চ্যানেলে পাঠানো হবে না
+                if PREMIUM_EMOJI_TARGET:
+                    # সব টার্গেট চ্যানেলে পাঠাও
+                    for target_id in TELEGRAM_TARGET_CHANNELS:
+                        if isinstance(event.message.media, (MessageMediaPhoto, MessageMediaDocument)):
+                            await client.send_file(
+                                target_id,
+                                event.message.media,
+                                caption=converted_text if converted_text.strip() else None,
+                                formatting_entities=entities if converted_text.strip() else None
+                            )
+                            print(rainbow_text(f"📷 Sent media with caption to {target_id}"))
+                        else:
+                            if converted_text.strip():
+                                await client.send_message(
+                                    target_id,
+                                    converted_text,
+                                    formatting_entities=entities
+                                )
+                                print(rainbow_text(f"✅ Forwarded text to {target_id}"))
+                            else:
+                                print(rainbow_text("⚠️ No text to send."))
+                else:
+                    print(rainbow_text("ℹ️ Premium emoji target is OFF. Skipping target channels."))
+
+            except Exception as e:
+                print(rainbow_text(f"❌ Error handling message: {e}"))
+
+        print(rainbow_text(f"👂 Listening for messages from @{TELEGRAM_SOURCE_CHANNEL}..."))
+        await client.run_until_disconnected()
+
+    except Exception as e:
+        print(rainbow_text(f"❌ Telegram client error: {e}"))
+    finally:
+        await client.disconnect()
+
+def start_telegram_client():
+    """টেলিগ্রাম ক্লায়েন্ট শুরু করে"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(telegram_client_task())
+
+# ================= রেইনবো টেক্সট ফাংশন =================
+
+def rainbow_text(text):
+    """টেক্সটকে রেইনবো কালারে প্রদর্শন করে"""
+    colors = [Fore.RED, Fore.YELLOW, Fore.GREEN, Fore.CYAN, Fore.BLUE, Fore.MAGENTA]
+    rainbow_text = ""
+    for i, char in enumerate(text):
+        color = colors[i % len(colors)]
+        rainbow_text += color + char
+    return rainbow_text + Fore.RESET
+
+def rainbow_line(text):
+    """সম্পূর্ণ লাইনকে রেইনবো কালারে প্রদর্শন করে"""
+    colors = [Fore.RED, Fore.YELLOW, Fore.GREEN, Fore.CYAN, Fore.BLUE, Fore.MAGENTA]
+    color = colors[int(time.time()) % len(colors)]
+    return color + text + Fore.RESET
+
+# ================= ফ্যান্সি ফন্ট ফাংশন (আপডেট) =================
+
+def fancy_font(text):
+    """সাধারণ লেখাকে সুন্দর ফন্টে পরিবর্তন করে"""
+    mapping = {
+        'A': '𝙰', 'B': '𝙱', 'C': '𝙲', 'D': '𝙳', 'E': '𝙴', 'F': '𝙵', 'G': '𝙶', 'H': '𝙷', 'I': '𝙸', 'J': '𝙹',
+        'K': '𝙺', 'L': '𝙻', 'M': '𝙼', 'N': '𝙽', 'O': '𝙾', 'P': '𝙿', 'Q': '𝚀', 'R': '𝚁', 'S': '𝚂', 'T': '𝚃',
+        'U': '𝚄', 'V': '𝚅', 'W': '𝚆', 'X': '𝚇', 'Y': '𝚈', 'Z': '𝚉',
+        'a': '𝚊', 'b': '𝚋', 'c': '𝚌', 'd': '𝚍', 'e': '𝚎', 'f': '𝚏', 'g': '𝚐', 'h': '𝚑', 'i': '𝚒', 'j': '𝚓',
+        'k': '𝚔', 'l': '𝚕', 'm': '𝚖', 'n': '𝚗', 'o': '𝚘', 'p': '𝚙', 'q': '𝚚', 'r': '𝚛', 's': '𝚜', 't': '𝚝',
+        'u': '𝚞', 'v': '𝚟', 'w': '𝠋', 'x': '𝚡', 'y': '𝚢', 'z': '𝚣',
+        '0': '𝟶', '1': '𝟷', '2': '𝟸', '3': '𝟹', '4': '𝟺', '5': '𝟻', '6': '𝟼', '7': '𝟽', '8': '𝟾', '9': '𝟿',
+        ':': '：', '.': '．', '/': '╱', '-': '—', '_': '＿', '@': '＠', '!': '！', '?': '？',
+        '(': '（', ')': '）', '[': '【', ']': '】', '{': '｛', '}': '｝', '<': '＜', '>': '＞',
+        '=': '＝', '+': '＋', '*': '＊', '&': '＆', '^': '＾', '$': '＄', '#': '＃', '~': '～'
+    }
+    return "".join(mapping.get(char, char) for char in str(text))
+
+# ================= ডাটা ম্যানেজমেন্ট ফাংশন (আপডেট) =================
+
+def load_trade_results():
+    """JSON ফাইল থেকে ডাটা লোড করে"""
+    global trade_results, MARTINGALE_STEPS, PARTIAL_RESULTS_INTERVAL, SEND_PHOTO_WITH_SIGNAL
+    global CHART_BACKGROUND_IMAGE_PATH, ANALYZE_ALL_PAIRS, CUSTOM_PAIRS_MODE, CUSTOM_PAIRS_LIST
+    global EMA_PERIOD, RSI_PERIOD, CURRENT_STRATEGY, MARK_RESULT_CANDLE, MIN_SIGNAL_SCORE
+    global SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SUPPORT_RESISTANCE_STRATEGY
+    global SHOW_GRID_LINES, SHOW_PRICE_SCALE, TELEGRAM_BOT_TOKEN, TREND_LINES, BACKGROUND_TRANSPARENCY
+    global TELEGRAM_CHAT_ID, SIGNAL_USERNAME, SIGNAL_INTERVAL_MIN, SIGNAL_INTERVAL_MAX
+    global TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
+    global TELEGRAM_SOURCE_CHANNEL, TELEGRAM_TARGET_CHANNELS, PREMIUM_EMOJI_MODE, PREMIUM_EMOJI_TARGET
+    global CHART_TEXT_GLOW, WATERMARK_ON, WATERMARK_TEXT, SIGNAL_HEADER_TEXT, CHART_HEADER_TEXT, RESULT_FOOTER_TEXT
+    global PARABOLIC_SAR_LINES, GAP_DRAWING, REVERSE_AREA_DRAWING, ADVANCED_ANALYSIS, CUSTOM_LINK
+    global FVG_GAP_DRAW, BOT_ALERT_ON, CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, EMA_LINE_CHART
+    global SUPERTREND_CHART, SUPERTREND_STRATEGY, SNR_LINES
+    
+    try:
+        if os.path.exists(SAVE_FILE):
+            with open(SAVE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+                if isinstance(data, list):
+                    trade_results = data
+                elif isinstance(data, dict):
+                    trade_results = data.get('all_results', [])
+
+                    settings = data.get('settings', {})
+                    MARTINGALE_STEPS = settings.get('MARTINGALE_STEPS', MARTINGALE_STEPS)
+                    PARTIAL_RESULTS_INTERVAL = settings.get('PARTIAL_RESULTS_INTERVAL', PARTIAL_RESULTS_INTERVAL)
+                    SEND_PHOTO_WITH_SIGNAL = settings.get('SEND_MARKET_CHART', settings.get('SEND_PHOTO_WITH_SIGNAL', SEND_PHOTO_WITH_SIGNAL))
+                    CHART_BACKGROUND_IMAGE_PATH = settings.get('CHART_BACKGROUND_IMAGE_PATH', CHART_BACKGROUND_IMAGE_PATH)
+                    ANALYZE_ALL_PAIRS = settings.get('ANALYZE_ALL_PAIRS', ANALYZE_ALL_PAIRS)
+                    
+                    # --- নতুন সেটিং লোড ---
+                    CUSTOM_PAIRS_MODE = settings.get('CUSTOM_PAIRS_MODE', CUSTOM_PAIRS_MODE)
+                    loaded_list = settings.get('CUSTOM_PAIRS_LIST', CUSTOM_PAIRS_LIST)
+                    if isinstance(loaded_list, str):
+                        CUSTOM_PAIRS_LIST = [p.strip() for p in loaded_list.split(',') if p.strip()]
+                    elif isinstance(loaded_list, list):
+                        CUSTOM_PAIRS_LIST = loaded_list
+                    EMA_PERIOD = settings.get('EMA_PERIOD', EMA_PERIOD)
+                    RSI_PERIOD = settings.get('RSI_PERIOD', RSI_PERIOD)
+                    CURRENT_STRATEGY = settings.get('CURRENT_STRATEGY', CURRENT_STRATEGY)
+                    MARK_RESULT_CANDLE = settings.get('MARK_RESULT_CANDLE', MARK_RESULT_CANDLE)
+                    MIN_SIGNAL_SCORE = settings.get('MIN_SIGNAL_SCORE', MIN_SIGNAL_SCORE)
+                    
+                    # নতুন চার্ট সেটিংস
+                    SUPPORT_RESISTANCE_LINES = settings.get('SUPPORT_RESISTANCE_LINES', SUPPORT_RESISTANCE_LINES)
+                    MOVING_AVERAGE_LINES = settings.get('MOVING_AVERAGE_LINES', MOVING_AVERAGE_LINES)
+                    SUPPORT_RESISTANCE_STRATEGY = settings.get('SUPPORT_RESISTANCE_STRATEGY', SUPPORT_RESISTANCE_STRATEGY)
+                    SHOW_GRID_LINES = settings.get('SHOW_GRID_LINES', SHOW_GRID_LINES)
+                    SHOW_PRICE_SCALE = settings.get('SHOW_PRICE_SCALE', SHOW_PRICE_SCALE)
+                    TREND_LINES = settings.get('TREND_LINES', TREND_LINES)
+                    BACKGROUND_TRANSPARENCY = settings.get('BACKGROUND_TRANSPARENCY', BACKGROUND_TRANSPARENCY)
+                    CHART_TEXT_GLOW = settings.get('CHART_TEXT_GLOW', CHART_TEXT_GLOW)
+                    WATERMARK_ON = settings.get('WATERMARK_ON', WATERMARK_ON)
+                    WATERMARK_TEXT = settings.get('WATERMARK_TEXT', WATERMARK_TEXT)
+                    SIGNAL_HEADER_TEXT = settings.get('SIGNAL_HEADER_TEXT', SIGNAL_HEADER_TEXT)
+                    CHART_HEADER_TEXT = settings.get('CHART_HEADER_TEXT', CHART_HEADER_TEXT)
+                    RESULT_FOOTER_TEXT = settings.get('RESULT_FOOTER_TEXT', RESULT_FOOTER_TEXT)
+                    
+                    # নতুন অ্যাডভান্সড সেটিংস
+                    PARABOLIC_SAR_LINES = settings.get('PARABOLIC_SAR_LINES', PARABOLIC_SAR_LINES)
+                    GAP_DRAWING = settings.get('GAP_DRAWING', GAP_DRAWING)
+                    REVERSE_AREA_DRAWING = settings.get('REVERSE_AREA_DRAWING', REVERSE_AREA_DRAWING)
+                    ADVANCED_ANALYSIS = settings.get('ADVANCED_ANALYSIS', ADVANCED_ANALYSIS)
+                    CUSTOM_LINK = settings.get('CUSTOM_LINK', CUSTOM_LINK)
+                    
+                    # নতুন ফিচার সেটিংস
+                    FVG_GAP_DRAW = settings.get('FVG_GAP_DRAW', FVG_GAP_DRAW)
+                    BOT_ALERT_ON = settings.get('BOT_ALERT_ON', BOT_ALERT_ON)
+                    
+                    # ক্যান্ডেল কালার সেটিংস
+                    candle_up_color = settings.get('CANDLE_UP_COLOR', CANDLE_UP_COLOR)
+                    candle_down_color = settings.get('CANDLE_DOWN_COLOR', CANDLE_DOWN_COLOR)
+                    
+                    if isinstance(candle_up_color, list) and len(candle_up_color) == 3:
+                        CANDLE_UP_COLOR = tuple(candle_up_color)
+                    if isinstance(candle_down_color, list) and len(candle_down_color) == 3:
+                        CANDLE_DOWN_COLOR = tuple(candle_down_color)
+                    
+                    # EMA এবং সুপারট্রেন্ড সেটিংস
+                    EMA_LINE_CHART = settings.get('EMA_LINE_CHART', EMA_LINE_CHART)
+                    SUPERTREND_CHART = settings.get('SUPERTREND_CHART', SUPERTREND_CHART)
+                    SUPERTREND_STRATEGY = settings.get('SUPERTREND_STRATEGY', SUPERTREND_STRATEGY)
+                    SNR_LINES = settings.get('SNR_LINES', SNR_LINES)
+                    
+                    # Telegram settings
+                    TELEGRAM_BOT_TOKEN = settings.get('TELEGRAM_BOT_TOKEN', TELEGRAM_BOT_TOKEN)
+                    TELEGRAM_CHAT_ID = settings.get('TELEGRAM_CHAT_ID', TELEGRAM_CHAT_ID)
+                    SIGNAL_USERNAME = settings.get('SIGNAL_USERNAME', SIGNAL_USERNAME)
+                    SIGNAL_INTERVAL_MIN = settings.get('SIGNAL_INTERVAL_MIN', SIGNAL_INTERVAL_MIN)
+                    SIGNAL_INTERVAL_MAX = settings.get('SIGNAL_INTERVAL_MAX', SIGNAL_INTERVAL_MAX)
+                    
+                    # Telegram client settings
+                    TELEGRAM_API_ID = settings.get('TELEGRAM_API_ID', TELEGRAM_API_ID)
+                    TELEGRAM_API_HASH = settings.get('TELEGRAM_API_HASH', TELEGRAM_API_HASH)
+                    TELEGRAM_PHONE_NUMBER = settings.get('TELEGRAM_PHONE_NUMBER', TELEGRAM_PHONE_NUMBER)
+                    TELEGRAM_SOURCE_CHANNEL = settings.get('TELEGRAM_SOURCE_CHANNEL', TELEGRAM_SOURCE_CHANNEL)
+                    TELEGRAM_TARGET_CHANNELS = settings.get('TELEGRAM_TARGET_CHANNELS', TELEGRAM_TARGET_CHANNELS)
+                    PREMIUM_EMOJI_MODE = settings.get('PREMIUM_EMOJI_MODE', PREMIUM_EMOJI_MODE)
+                    PREMIUM_EMOJI_TARGET = settings.get('PREMIUM_EMOJI_TARGET', PREMIUM_EMOJI_TARGET)
+                    # --- নতুন সেটিং লোড ---
+
+                else:
+                    trade_results = []
+            print(rainbow_text(f"✅ 𝙻𝚘𝚊𝚍𝚎𝚍 {len(trade_results)} 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚊𝚗𝚍 𝚜𝚎𝚝𝚝𝚒𝚗𝚐𝚜 𝚏𝚛𝚘𝚖 {SAVE_FILE}"))
+            return True
+        else:
+            print(rainbow_text(f"⚠ 𝙽𝚘 𝚍𝚊𝚝𝚊 𝚏𝚒𝚕𝚎 𝚏𝚘𝚞𝚗𝚍. 𝚂𝚝𝚊𝚛𝚝𝚒𝚗𝚐 𝚏𝚛𝚎𝚜𝚑..."))
+            trade_results = []
+            return False
+    except Exception as e:
+        print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚕𝚘𝚊𝚍𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜: {e}"))
+        trade_results = []
+        return False
+
+def save_trade_results():
+    """ডাটা এবং সেটিংস JSON ফাইলে সেভ করে"""
+    global ANALYZE_ALL_PAIRS, SEND_PHOTO_WITH_SIGNAL, CUSTOM_PAIRS_MODE, CUSTOM_PAIRS_LIST
+    global EMA_PERIOD, RSI_PERIOD, CURRENT_STRATEGY, MARK_RESULT_CANDLE, MIN_SIGNAL_SCORE
+    global SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SUPPORT_RESISTANCE_STRATEGY
+    global SHOW_GRID_LINES, SHOW_PRICE_SCALE, TELEGRAM_BOT_TOKEN, TREND_LINES, BACKGROUND_TRANSPARENCY
+    global TELEGRAM_CHAT_ID, SIGNAL_USERNAME, SIGNAL_INTERVAL_MIN, SIGNAL_INTERVAL_MAX
+    global TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
+    global TELEGRAM_SOURCE_CHANNEL, TELEGRAM_TARGET_CHANNELS, PREMIUM_EMOJI_MODE, PREMIUM_EMOJI_TARGET
+    global CHART_TEXT_GLOW, WATERMARK_ON, WATERMARK_TEXT, SIGNAL_HEADER_TEXT, CHART_HEADER_TEXT, RESULT_FOOTER_TEXT
+    global PARABOLIC_SAR_LINES, GAP_DRAWING, REVERSE_AREA_DRAWING, ADVANCED_ANALYSIS, CUSTOM_LINK
+    global FVG_GAP_DRAW, BOT_ALERT_ON, CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, EMA_LINE_CHART
+    global SUPERTREND_CHART, SUPERTREND_STRATEGY, SNR_LINES
+    
+    try:
+        data_to_save = {
+            "all_results": trade_results,
+            "settings": {
+                "MARTINGALE_STEPS": MARTINGALE_STEPS,
+                "PARTIAL_RESULTS_INTERVAL": PARTIAL_RESULTS_INTERVAL,
+                "SEND_MARKET_CHART": SEND_PHOTO_WITH_SIGNAL,
+                "CHART_BACKGROUND_IMAGE_PATH": CHART_BACKGROUND_IMAGE_PATH,
+                "ANALYZE_ALL_PAIRS": ANALYZE_ALL_PAIRS,
+                
+                # --- নতুন সেটিং সেভ ---
+                "CUSTOM_PAIRS_MODE": CUSTOM_PAIRS_MODE,
+                "CUSTOM_PAIRS_LIST": CUSTOM_PAIRS_LIST,
+                "EMA_PERIOD": EMA_PERIOD,
+                "RSI_PERIOD": RSI_PERIOD,
+                "CURRENT_STRATEGY": CURRENT_STRATEGY,
+                "MARK_RESULT_CANDLE": MARK_RESULT_CANDLE,
+                "MIN_SIGNAL_SCORE": MIN_SIGNAL_SCORE,
+                
+                # নতুন চার্ট সেটিংস
+                "SUPPORT_RESISTANCE_LINES": SUPPORT_RESISTANCE_LINES,
+                "MOVING_AVERAGE_LINES": MOVING_AVERAGE_LINES,
+                "SUPPORT_RESISTANCE_STRATEGY": SUPPORT_RESISTANCE_STRATEGY,
+                "SHOW_GRID_LINES": SHOW_GRID_LINES,
+                "SHOW_PRICE_SCALE": SHOW_PRICE_SCALE,
+                "TREND_LINES": TREND_LINES,
+                "BACKGROUND_TRANSPARENCY": BACKGROUND_TRANSPARENCY,
+                "CHART_TEXT_GLOW": CHART_TEXT_GLOW,
+                "WATERMARK_ON": WATERMARK_ON,
+                "WATERMARK_TEXT": WATERMARK_TEXT,
+                "SIGNAL_HEADER_TEXT": SIGNAL_HEADER_TEXT,
+                "CHART_HEADER_TEXT": CHART_HEADER_TEXT,
+                "RESULT_FOOTER_TEXT": RESULT_FOOTER_TEXT,
+                
+                # নতুন অ্যাডভান্সড সেটিংস
+                "PARABOLIC_SAR_LINES": PARABOLIC_SAR_LINES,
+                "GAP_DRAWING": GAP_DRAWING,
+                "REVERSE_AREA_DRAWING": REVERSE_AREA_DRAWING,
+                "ADVANCED_ANALYSIS": ADVANCED_ANALYSIS,
+                "CUSTOM_LINK": CUSTOM_LINK,
+                
+                # নতুন ফিচার সেটিংস
+                "FVG_GAP_DRAW": FVG_GAP_DRAW,
+                "BOT_ALERT_ON": BOT_ALERT_ON,
+                
+                # ক্যান্ডেল কালার সেটিংস
+                "CANDLE_UP_COLOR": list(CANDLE_UP_COLOR),
+                "CANDLE_DOWN_COLOR": list(CANDLE_DOWN_COLOR),
+                
+                # EMA এবং সুপারট্রেন্ড সেটিংস
+                "EMA_LINE_CHART": EMA_LINE_CHART,
+                "SUPERTREND_CHART": SUPERTREND_CHART,
+                "SUPERTREND_STRATEGY": SUPERTREND_STRATEGY,
+                "SNR_LINES": SNR_LINES,
+                
+                # Telegram settings
+                "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+                "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+                "SIGNAL_USERNAME": SIGNAL_USERNAME,
+                "SIGNAL_INTERVAL_MIN": SIGNAL_INTERVAL_MIN,
+                "SIGNAL_INTERVAL_MAX": SIGNAL_INTERVAL_MAX,
+                
+                # Telegram client settings
+                "TELEGRAM_API_ID": TELEGRAM_API_ID,
+                "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
+                "TELEGRAM_PHONE_NUMBER": TELEGRAM_PHONE_NUMBER,
+                "TELEGRAM_SOURCE_CHANNEL": TELEGRAM_SOURCE_CHANNEL,
+                "TELEGRAM_TARGET_CHANNELS": TELEGRAM_TARGET_CHANNELS,
+                "PREMIUM_EMOJI_MODE": PREMIUM_EMOJI_MODE,
+                "PREMIUM_EMOJI_TARGET": PREMIUM_EMOJI_TARGET
+                # --- নতুন সেটিং সেভ ---
+            },
+            "last_updated": datetime.now(pytz.timezone('Asia/Dhaka')).isoformat(),
+            "version": "8.0_Complete_Features_Update"
+        }
+
+        with open(SAVE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+
+        print(rainbow_text(f"✅ 𝚂𝚊𝚟𝚎𝚍 {len(trade_results)} 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚊𝚗𝚍 𝚜𝚎𝚝𝚝𝚒𝚗𝚐𝚜 𝚝𝚘 {SAVE_FILE}"))
+        return True
+    except Exception as e:
+        print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚜𝚊𝚟𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜: {e}"))
+        return False
+
+def get_today_results():
+    """আজকের তারিখের রেজাল্টগুলো রিটার্ন করে (শুধুমাত্র নিশ্চিত রেজাল্ট)"""
+    today = datetime.now(pytz.timezone('Asia/Dhaka')).date()
+    today_str = today.isoformat()
+
+    today_results = []
+    for result in trade_results:
+        # শুধুমাত্র নিশ্চিত রেজাল্টগুলো (Profit/Loss/Break-even)
+        if result.get('result') not in ['Profit', 'Loss', 'Break-even']:
+            continue
+            
+        result_date_str = result.get('date')
+        if not result_date_str:
+            try:
+                if 'timestamp' in result:
+                    dt = datetime.fromtimestamp(result['timestamp'], pytz.timezone('Asia/Dhaka'))
+                    result_date_str = dt.date().isoformat()
+                elif 'signal_datetime' in result:
+                    dt = datetime.fromisoformat(result['signal_datetime'].replace('Z', '+00:00'))
+                    dt = dt.astimezone(pytz.timezone('Asia/Dhaka'))
+                    result_date_str = dt.date().isoformat()
+            except:
+                continue
+
+        if result_date_str == today_str:
+            today_results.append(result)
+
+    return today_results
+
+def get_statistics(results_list=None):
+    """সামগ্রিক স্ট্যাটিস্টিক্স রিটার্ন করে"""
+    if results_list is None:
+        results_list = trade_results
+
+    # শুধুমাত্র 'Profit' বা 'Loss' রেজাল্টগুলোকে গণনায় নেওয়া হবে
+    completed_trades = [r for r in results_list if r.get('result') in ['Profit', 'Loss']]
+
+    total = len(completed_trades)
+    wins = sum(1 for r in completed_trades if r.get('result') == 'Profit')
+    losses = sum(1 for r in completed_trades if r.get('result') == 'Loss')
+
+    if total > 0:
+        accuracy = (wins / total) * 100
+    else:
+        accuracy = 0
+
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "accuracy": round(accuracy, 2)
+    }
+
+# ================= টেলিগ্রাম ফাংশন (আপডেট) =================
+
+async def send_telegram_photo_or_chart(caption, pair=None, candles=None, result=None, signal_direction=None, entry_time=None):
+    """Sends a photo (custom or chart) with a caption to Telegram."""
+    global SEND_PHOTO_WITH_SIGNAL, CHART_BACKGROUND_IMAGE_PATH
+
+    try:
+        if SEND_PHOTO_WITH_SIGNAL and pair and candles:
+            # Send Market Chart Image
+            image_buffer = create_chart_image(pair, candles, result=result, caption=caption, signal_direction=signal_direction, entry_time=entry_time)
+
+            if not image_buffer:
+                print(rainbow_text("❌ 𝙲𝚑𝚊𝚛𝚝 𝚒𝚖𝚊𝚐𝚎 𝚌𝚛𝚎𝚊𝚝𝚒𝚘𝚗 𝚏𝚊𝚒𝚕𝚎𝚍. 𝚂𝚎𝚗𝚍𝚒𝚗𝚐 𝚊𝚜 𝚝𝚎𝚡𝚝 𝚖𝚎𝚜𝚜𝚊𝚐𝚎."))
+                return send_telegram_message(caption)
+
+            print(rainbow_text(f"📸 𝚂𝚎𝚗𝚍𝚒𝚗𝚐 𝚌𝚑𝚊𝚛𝚝 𝚏𝚘𝚛 {pair} 𝚝𝚘 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖..."))
+
+            image_buffer.seek(0)
+            image_name = f"{(pair or 'chart').replace('/', '_')}_{int(time.time())}.png"
+            tg_photo = InputFile(image_buffer, filename=image_name)
+            try:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=tg_photo,
+                    caption=caption,
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return True
+            except Exception as send_err:
+                print(rainbow_text(f"⚠️ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚋𝚘𝚝 𝚙𝚑𝚘𝚝𝚘 𝚜𝚎𝚗𝚍 𝚏𝚊𝚒𝚕𝚎𝚍, 𝚛𝚎𝚝𝚛𝚢𝚒𝚗𝚐 𝚟𝚒𝚊 𝙷𝚃𝚃𝙿: {send_err}"))
+                image_buffer.seek(0)
+                send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                }
+                files = {
+                    "photo": (image_name, image_buffer.getvalue(), "image/png")
+                }
+                r = requests.post(send_photo_url, data=payload, files=files, timeout=20)
+                if r.status_code == 200:
+                    return True
+                raise Exception(f"HTTP sendPhoto failed: {r.status_code} - {r.text}")
+
+        else:
+            # Send as text message
+            print(rainbow_text(f"📸 𝚂𝚎𝚗𝚍𝚒𝚗𝚐 𝚝𝚎𝚡𝚝 𝚖𝚎𝚜𝚜𝚊𝚐𝚎 𝚝𝚘 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖..."))
+            return send_telegram_message(caption)
+
+    except Exception as e:
+        print(rainbow_text(f"❌ 𝙵𝚊𝚒𝚕𝚎𝚍 𝚝𝚘 𝚜𝚎𝚗𝚍 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚙𝚑𝚘𝚝𝚘/𝚌𝚑𝚊𝚛𝚝: {e}"))
+        # Fallback: send the caption as a regular message if image fails
+        return send_telegram_message(caption)
+
+def send_telegram_message(message):
+    """Sends a text message to Telegram with automatic retry on failure."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True
+    }
+    for attempt in range(3):
+        try:
+            response = session.post(url, data=payload, timeout=15)
+            if response.status_code == 200:
+                return True
+            # Telegram returned an error - log it but retry
+            print(rainbow_text(f"𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙷𝚃𝚃𝙿 {response.status_code}: {response.text[:120]}"))
+        except Exception as e:
+            print(rainbow_text(f"𝚂𝚎𝚗𝚍 𝚊𝚝𝚝𝚎𝚖𝚙𝚝 {attempt+1}/3 𝚏𝚊𝚒𝚕𝚎𝚍: {e}"))
+        if attempt < 2:
+            time.sleep(2)
+    # Final fallback: raw requests (no session)
+    try:
+        response = requests.post(url, data=payload, timeout=20, verify=False)
+        return response.status_code == 200
+    except Exception as e:
+        print(rainbow_text(f"𝙵𝚒𝚗𝚊𝚕 𝚏𝚊𝚕𝚕𝚋𝚊𝚌𝚔 𝚏𝚊𝚒𝚕𝚎𝚍: {e}"))
+        return False
+
+# ================= নতুন টেকনিক্যাল ইন্ডিকেটর ফাংশন =================
+
+def calculate_parabolic_sar(candles, acceleration=0.02, maximum=0.2):
+    """প্যারাবলিক SAR ইন্ডিকেটর ক্যালকুলেট করে"""
+    if len(candles) < 5:
+        return []
+    
+    sar_values = []
+    high = [c['high'] for c in candles]
+    low = [c['low'] for c in candles]
+    
+    # Initial values
+    uptrend = True
+    sar = low[0]
+    ep = high[0]
+    af = acceleration
+    
+    for i in range(len(candles)):
+        # Store current SAR
+        sar_values.append(sar)
+        
+        if uptrend:
+            # Check for SAR reversal
+            if low[i] < sar:
+                uptrend = False
+                sar = ep
+                ep = low[i]
+                af = acceleration
+            else:
+                # Update SAR
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af + acceleration, maximum)
+                
+                sar = sar + af * (ep - sar)
+                
+                # Ensure SAR is below the low of the previous two candles
+                if i >= 2:
+                    sar = min(sar, low[i-1], low[i-2])
+        else:
+            # Downtrend
+            if high[i] > sar:
+                uptrend = True
+                sar = ep
+                ep = high[i]
+                af = acceleration
+            else:
+                # Update SAR
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af + acceleration, maximum)
+                
+                sar = sar + af * (ep - sar)
+                
+                # Ensure SAR is above the high of the previous two candles
+                if i >= 2:
+                    sar = max(sar, high[i-1], high[i-2])
+    
+    return sar_values
+
+def calculate_gaps(candles):
+    """গ্যাপ এলাকা ডিটেক্ট করে"""
+    if len(candles) < 2:
+        return []
+    
+    gaps = []
+    for i in range(1, len(candles)):
+        prev_close = candles[i-1]['close']
+        curr_open = candles[i]['open']
+        
+        # Check for gap up
+        if curr_open > prev_close * 1.001:  # 0.1% gap threshold
+            gaps.append({
+                'type': 'GAP_UP',
+                'start_price': prev_close,
+                'end_price': curr_open,
+                'candle_index': i
+            })
+        # Check for gap down
+        elif curr_open < prev_close * 0.999:  # 0.1% gap threshold
+            gaps.append({
+                'type': 'GAP_DOWN',
+                'start_price': prev_close,
+                'end_price': curr_open,
+                'candle_index': i
+            })
+    
+    return gaps
+
+def detect_reversal_areas(candles, lookback=10):
+    """রিভার্স এলাকা ডিটেক্ট করে"""
+    if len(candles) < lookback * 2:
+        return []
+    
+    reversal_areas = []
+    
+    # Find swing highs and lows
+    for i in range(lookback, len(candles) - lookback):
+        current_high = candles[i]['high']
+        current_low = candles[i]['low']
+        
+        # Check for swing high
+        is_swing_high = True
+        for j in range(1, lookback + 1):
+            if candles[i-j]['high'] > current_high or candles[i+j]['high'] > current_high:
+                is_swing_high = False
+                break
+        
+        # Check for swing low
+        is_swing_low = True
+        for j in range(1, lookback + 1):
+            if candles[i-j]['low'] < current_low or candles[i+j]['low'] < current_low:
+                is_swing_low = False
+                break
+        
+        if is_swing_high:
+            reversal_areas.append({
+                'type': 'SWING_HIGH',
+                'price': current_high,
+                'candle_index': i,
+                'timestamp': candles[i]['dt'] if 'dt' in candles[i] else None
+            })
+        
+        if is_swing_low:
+            reversal_areas.append({
+                'type': 'SWING_LOW',
+                'price': current_low,
+                'candle_index': i,
+                'timestamp': candles[i]['dt'] if 'dt' in candles[i] else None
+            })
+    
+    return reversal_areas
+
+def analyze_trend_reversal(candle_data):
+    """ট্রেন্ড রিভার্স অ্যানালাইসিস করে"""
+    if not candle_data or len(candle_data) < 20:
+        return None, None, None, None, None
+    
+    closes = [c['close'] for c in candle_data]
+    
+    # Calculate moving averages for trend detection
+    ma20 = ema(closes, 20) if len(closes) >= 20 else None
+    ma50 = ema(closes, 50) if len(closes) >= 50 else None
+    
+    # Calculate RSI for overbought/oversold conditions
+    rsi = calculate_rsi(closes, 14)
+    
+    # Calculate MACD
+    macd_line, signal_line, macd_histogram = calculate_macd(closes)
+    
+    # Detect trend
+    current_price = closes[-1]
+    trend = "SIDEWAYS"
+    
+    if ma20 and ma50:
+        if current_price > ma20 and ma20 > ma50:
+            trend = "UP_TREND"
+        elif current_price < ma20 and ma20 < ma50:
+            trend = "DOWN_TREND"
+    
+    # Detect potential reversal
+    reversal_signal = None
+    if trend == "UP_TREND" and rsi > 70:
+        reversal_signal = "POTENTIAL_DOWN_REVERSAL"
+    elif trend == "DOWN_TREND" and rsi < 30:
+        reversal_signal = "POTENTIAL_UP_REVERSAL"
+    
+    # Calculate support and resistance levels
+    support, resistance = calculate_support_resistance_levels(closes)
+    
+    # Determine signal logic
+    logic = None
+    if reversal_signal == "POTENTIAL_DOWN_REVERSAL":
+        logic = "Overbought with RSI > 70 in uptrend"
+    elif reversal_signal == "POTENTIAL_UP_REVERSAL":
+        logic = "Oversold with RSI < 30 in downtrend"
+    
+    return trend, reversal_signal, support, resistance, logic
+
+def calculate_macd(prices, fast_period=12, slow_period=26, signal_period=9):
+    """MACD ইন্ডিকেটর ক্যালকুলেট করে"""
+    if len(prices) < slow_period:
+        return None, None, None
+    
+    # Calculate EMAs
+    fast_ema = ema(prices, fast_period)
+    slow_ema = ema(prices, slow_period)
+    
+    if fast_ema is None or slow_ema is None:
+        return None, None, None
+    
+    # MACD Line
+    macd_line = fast_ema - slow_ema
+    
+    # Signal Line (EMA of MACD Line)
+    macd_prices = [macd_line]  # Simplified
+    signal_line = ema(macd_prices, signal_period)
+    
+    # MACD Histogram
+    macd_histogram = macd_line - signal_line if signal_line else None
+    
+    return macd_line, signal_line, macd_histogram
+
+# ================= নতুন FVG গ্যাপ ডিটেকশন ফাংশন =================
+
+def detect_fvg_gaps(candles, threshold=0.001):
+    """FVG (Fair Value Gap) গ্যাপ ডিটেক্ট করে"""
+    if len(candles) < 3:
+        return []
+    
+    fvg_gaps = []
+    
+    for i in range(1, len(candles) - 1):
+        prev_candle = candles[i-1]
+        curr_candle = candles[i]
+        next_candle = candles[i+1]
+        
+        # Bullish FVG: Current candle high > previous candle low and next candle low > current candle low
+        if (curr_candle['high'] > prev_candle['low'] and 
+            next_candle['low'] > curr_candle['low'] and
+            abs(curr_candle['high'] - prev_candle['low']) / prev_candle['low'] > threshold):
+            
+            fvg_gaps.append({
+                'type': 'BULLISH_FVG',
+                'start_price': prev_candle['low'],
+                'end_price': curr_candle['high'],
+                'candle_index': i,
+                'strength': (curr_candle['high'] - prev_candle['low']) / prev_candle['low']
+            })
+        
+        # Bearish FVG: Current candle low < previous candle high and next candle high < current candle high
+        if (curr_candle['low'] < prev_candle['high'] and 
+            next_candle['high'] < curr_candle['high'] and
+            abs(prev_candle['high'] - curr_candle['low']) / prev_candle['high'] > threshold):
+            
+            fvg_gaps.append({
+                'type': 'BEARISH_FVG',
+                'start_price': prev_candle['high'],
+                'end_price': curr_candle['low'],
+                'candle_index': i,
+                'strength': (prev_candle['high'] - curr_candle['low']) / prev_candle['high']
+            })
+    
+    return fvg_gaps
+
+# ================= নতুন সুপারট্রেন্ড ক্যালকুলেশন ফাংশন =================
+
+def calculate_supertrend(candles, period=10, multiplier=3):
+    """সুপারট্রেন্ড ইন্ডিকেটর ক্যালকুলেট করে"""
+    if len(candles) < period:
+        return [], []
+    
+    high = [c['high'] for c in candles]
+    low = [c['low'] for c in candles]
+    close = [c['close'] for c in candles]
+    
+    # Calculate ATR
+    def calculate_atr(high, low, close, period):
+        tr = []
+        for i in range(1, len(high)):
+            hl = high[i] - low[i]
+            hc = abs(high[i] - close[i-1])
+            lc = abs(low[i] - close[i-1])
+            tr.append(max(hl, hc, lc))
+        
+        atr = [sum(tr[:period]) / period]
+        for i in range(period, len(tr)):
+            atr.append((atr[-1] * (period - 1) + tr[i]) / period)
+        
+        return atr
+    
+    atr = calculate_atr(high, low, close, period)
+    
+    # Calculate Supertrend
+    supertrend = []
+    trend = []
+    
+    # Initial values
+    upper_band = (high[0] + low[0]) / 2 + multiplier * atr[0]
+    lower_band = (high[0] + low[0]) / 2 - multiplier * atr[0]
+    
+    for i in range(len(candles)):
+        if i < period:
+            supertrend.append(None)
+            trend.append(None)
+            continue
+        
+        # Basic bands
+        hl2 = (high[i] + low[i]) / 2
+        upper_band = hl2 + multiplier * atr[i-period]
+        lower_band = hl2 - multiplier * atr[i-period]
+        
+        # Adjust bands based on trend
+        if i == period:
+            supertrend.append(upper_band)
+            trend.append(1)  # Uptrend
+        else:
+            if close[i] > supertrend[-1]:
+                current_trend = 1  # Uptrend
+                supertrend.append(max(lower_band, supertrend[-1]) if trend[-1] == 1 else lower_band)
+            else:
+                current_trend = -1  # Downtrend
+                supertrend.append(min(upper_band, supertrend[-1]) if trend[-1] == -1 else upper_band)
+            
+            trend.append(current_trend)
+    
+    return supertrend, trend
+
+# ================= নতুন প্রাইস অ্যাকশন ডিটেকশন ফাংশন =================
+
+def detect_price_action_patterns(candles):
+    """প্রাইস অ্যাকশন প্যাটার্ন ডিটেক্ট করে"""
+    if len(candles) < 5:
+        return []
+    
+    patterns = []
+    
+    for i in range(2, len(candles) - 2):
+        # Bullish Engulfing
+        if (candles[i-1]['close'] < candles[i-1]['open'] and  # Previous bearish
+            candles[i]['close'] > candles[i]['open'] and       # Current bullish
+            candles[i]['open'] < candles[i-1]['close'] and     # Opens below previous close
+            candles[i]['close'] > candles[i-1]['open']):       # Closes above previous open
+            
+            patterns.append({
+                'type': 'BULLISH_ENGULFING',
+                'candle_index': i,
+                'strength': (candles[i]['close'] - candles[i-1]['open']) / candles[i-1]['open']
+            })
+        
+        # Bearish Engulfing
+        elif (candles[i-1]['close'] > candles[i-1]['open'] and  # Previous bullish
+              candles[i]['close'] < candles[i]['open'] and       # Current bearish
+              candles[i]['open'] > candles[i-1]['close'] and     # Opens above previous close
+              candles[i]['close'] < candles[i-1]['open']):       # Closes below previous open
+            
+            patterns.append({
+                'type': 'BEARISH_ENGULFING',
+                'candle_index': i,
+                'strength': (candles[i-1]['open'] - candles[i]['close']) / candles[i-1]['open']
+            })
+        
+        # Hammer
+        elif (candles[i]['close'] > candles[i]['open'] and  # Bullish
+              (candles[i]['high'] - candles[i]['low']) > 3 * (candles[i]['close'] - candles[i]['open']) and  # Long lower wick
+              (candles[i]['close'] - candles[i]['low']) > 0.6 * (candles[i]['high'] - candles[i]['low'])):  # Close near high
+            
+            patterns.append({
+                'type': 'HAMMER',
+                'candle_index': i,
+                'strength': (candles[i]['close'] - candles[i]['low']) / (candles[i]['high'] - candles[i]['low'])
+            })
+        
+        # Shooting Star
+        elif (candles[i]['close'] < candles[i]['open'] and  # Bearish
+              (candles[i]['high'] - candles[i]['low']) > 3 * (candles[i]['open'] - candles[i]['close']) and  # Long upper wick
+              (candles[i]['high'] - candles[i]['open']) > 0.6 * (candles[i]['high'] - candles[i]['low'])):  # Open near low
+            
+            patterns.append({
+                'type': 'SHOOTING_STAR',
+                'candle_index': i,
+                'strength': (candles[i]['high'] - candles[i]['open']) / (candles[i]['high'] - candles[i]['low'])
+            })
+    
+    return patterns
+
+# ================= SNR লেভেল ক্যালকুলেশন =================
+
+def calculate_snr_levels(prices, num_levels=5):
+    """SNR (Support and Resistance) লেভেল ক্যালকুলেট করে"""
+    if len(prices) < 20:
+        return []
+    
+    # Find local highs and lows
+    local_highs = []
+    local_lows = []
+    
+    for i in range(2, len(prices) - 2):
+        if (prices[i] > prices[i-1] and prices[i] > prices[i-2] and 
+            prices[i] > prices[i+1] and prices[i] > prices[i+2]):
+            local_highs.append(prices[i])
+        
+        if (prices[i] < prices[i-1] and prices[i] < prices[i-2] and 
+            prices[i] < prices[i+1] and prices[i] < prices[i+2]):
+            local_lows.append(prices[i])
+    
+    # Combine and sort levels
+    all_levels = local_highs + local_lows
+    all_levels.sort()
+    
+    # Cluster nearby levels
+    clusters = []
+    current_cluster = []
+    cluster_threshold = (max(prices) - min(prices)) * 0.01  # 1% threshold
+    
+    for level in all_levels:
+        if not current_cluster:
+            current_cluster.append(level)
+        elif abs(level - np.mean(current_cluster)) < cluster_threshold:
+            current_cluster.append(level)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [level]
+    
+    if current_cluster:
+        clusters.append(current_cluster)
+    
+    # Calculate average for each cluster
+    snr_levels = []
+    for cluster in clusters:
+        if len(cluster) >= 2:  # Only consider clusters with at least 2 points
+            avg_level = np.mean(cluster)
+            strength = len(cluster)
+            snr_levels.append({
+                'level': avg_level,
+                'strength': strength,
+                'type': 'RESISTANCE' if avg_level > np.mean(prices) else 'SUPPORT'
+            })
+    
+    # Sort by strength and return top levels
+    snr_levels.sort(key=lambda x: x['strength'], reverse=True)
+    return snr_levels[:num_levels]
+
+# ================= এডভান্সড চার্ট জেনারেশন ফাংশন (আপডেটেড) =================
+
+def load_fonts():
+    """ট্রি ফন্ট লোড করে"""
+    try:
+        # Try to load different fonts for better appearance
+        font_large = ImageFont.truetype("arialbd.ttf", 24)
+        font_medium = ImageFont.truetype("arial.ttf", 16)
+        font_small = ImageFont.truetype("arial.ttf", 12)
+        font_tiny = ImageFont.truetype("arial.ttf", 10)
+        return font_large, font_medium, font_small, font_tiny
+    except:
+        try:
+            # Alternative fonts for Linux
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 24)
+            font_medium = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 16)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 12)
+            font_tiny = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 10)
+            return font_large, font_medium, font_small, font_tiny
+        except:
+            # Default font as last resort
+            return ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
+
+def draw_dashed_line(draw, start, end, color, width=1, dash_length=5):
+    """Draw a dashed line manually"""
+    x1, y1 = start
+    x2, y2 = end
+    
+    # Calculate line length and direction
+    dx = x2 - x1
+    dy = y2 - y1
+    length = np.sqrt(dx**2 + dy**2)
+    
+    if length == 0:
+        return
+    
+    # Normalize direction
+    dx /= length
+    dy /= length
+    
+    # Draw dashed segments
+    drawn_length = 0
+    while drawn_length < length:
+        dash_start = (x1 + dx * drawn_length, y1 + dy * drawn_length)
+        dash_end_length = min(dash_length, length - drawn_length)
+        dash_end = (x1 + dx * (drawn_length + dash_end_length), 
+                   y1 + dy * (drawn_length + dash_end_length))
+        
+        draw.line([dash_start, dash_end], fill=color, width=width)
+        drawn_length += dash_length * 2
+
+def create_chart_image(pair: str, candles: List[Dict], result=None, caption: str = "", signal_direction: str = None, entry_time: str = None) -> BytesIO:
+    global MARK_RESULT_CANDLE, SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SHOW_GRID_LINES, SHOW_PRICE_SCALE, TREND_LINES, BACKGROUND_TRANSPARENCY, CHART_TEXT_GLOW, WATERMARK_ON, WATERMARK_TEXT, CHART_HEADER_TEXT
+    global PARABOLIC_SAR_LINES, GAP_DRAWING, REVERSE_AREA_DRAWING, FVG_GAP_DRAW, CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, EMA_LINE_CHART, SUPERTREND_CHART, SNR_LINES
+    
+    if not candles:
+        return None
+
+    # চার্ট সাইজ
+    WIDTH, HEIGHT = 1100, 580
+    
+    # === Reference image-like color theme ===
+    BACKGROUND_COLOR = (0, 0, 0)            # Solid black background
+    GREEN = CANDLE_UP_COLOR                  # Teal/cyan by default
+    RED = CANDLE_DOWN_COLOR                  # Bright red
+    WHITE = (255, 255, 255)
+    GRAY = (90, 100, 120)
+    LIGHT_GRAY = (150, 160, 175)
+    DARK_GRAY = (30, 35, 50)
+    TEAL = (0, 229, 200)
+    LIGHT_BLUE = (120, 180, 220)
+    DARK_BLUE = (12, 18, 38)
+    YELLOW = (255, 220, 0)
+    GRID_COLOR = (28, 38, 58)               # Very subtle grid
+    SUPPORT_COLOR = (0, 200, 120)
+    RESISTANCE_COLOR = (220, 60, 60)
+    MA_COLORS = [(255, 200, 0), (0, 200, 255), (200, 0, 255)]
+    TREND_LINE_COLOR = (255, 165, 0)
+    PARABOLIC_SAR_COLOR = (255, 80, 220)
+    GAP_COLOR = (255, 220, 0)
+    FVG_COLOR = (255, 140, 0)
+    SUPERTREND_UP_COLOR = (0, 220, 160)
+    SUPERTREND_DOWN_COLOR = (220, 60, 60)
+    EMA_COLOR = (255, 220, 0)
+    SNR_COLOR = (255, 140, 0)
+    
+    # Create base image with solid background
+    img = Image.new('RGB', (WIDTH, HEIGHT), color=BACKGROUND_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Keep a clean, solid-black background for the chart body.
+
+    # ফন্ট লোড (ছোট ফন্ট সাইজ যাতে সব টেক্সট ফিট হয়)
+    font_large, font_medium, font_small, font_tiny = load_fonts()
+
+    header_y = 10
+
+    # --- Header config ---
+    is_result     = result is not None
+    tf_label      = f"M{TIMEFRAME//60}" if TIMEFRAME >= 60 else f"S{TIMEFRAME}"
+    # Use explicitly passed direction first; fall back to last candle's signal
+    if signal_direction is not None:
+        sig_text = signal_direction.upper()
+    else:
+        sig_text = candles[-1].get('signal', 'CALL') if candles else 'CALL'
+    sig_color     = GREEN if sig_text == 'CALL' else RED
+    sig_direction = sig_text  # 'CALL' or 'PUT'
+
+    if not is_result:
+        title_text   = CHART_HEADER_TEXT
+        status_label = "SIGNAL STATUS"
+        status_icon  = "antenna"
+    else:
+        first_word   = CHART_HEADER_TEXT.split()[0] if CHART_HEADER_TEXT else "BOT"
+        title_text   = first_word + " RESULTS"
+        status_label = "RESULT"
+        status_icon  = "target"
+
+    if not is_result:
+        if sig_direction == "PUT":
+            status_value  = "SELL"
+            strip_fill    = (120, 20, 20)
+            strip_outline = (210, 60, 60)
+            sv_color      = (255, 230, 230)
+            status_dot_color = (220, 60, 60)
+        else:
+            status_value  = "BUY"
+            strip_fill    = (15, 90, 35)
+            strip_outline = (40, 200, 80)
+            sv_color      = (220, 255, 225)
+            status_dot_color = (60, 220, 80)
+    else:
+        if result == "Profit":
+            status_value  = "WIN"
+            strip_fill    = (15, 90, 35)
+            strip_outline = (40, 200, 80)
+            sv_color      = (100, 255, 140)
+            status_dot_color = (60, 220, 80)
+        elif result == "Loss":
+            status_value  = "LOSS"
+            strip_fill    = (120, 20, 20)
+            strip_outline = (210, 60, 60)
+            sv_color      = (255, 100, 100)
+            status_dot_color = (220, 60, 60)
+        else:
+            status_value  = "BE"
+            strip_fill    = (100, 80, 10)
+            strip_outline = (210, 180, 30)
+            sv_color      = (255, 240, 180)
+            status_dot_color = (220, 180, 30)
+
+    # Time: use explicitly passed entry_time (matches caption) or fall back to last candle
+    if entry_time is not None:
+        candle_time = entry_time
+    else:
+        try:
+            candle_time = candles[-1]['dt'].strftime("%H:%M") if candles and candles[-1].get('dt') else datetime.now(UTC_PLUS_6).strftime("%H:%M")
+        except Exception:
+            candle_time = datetime.now(UTC_PLUS_6).strftime("%H:%M")
+
+    # Today's win/loss stats
+    _today_iso  = datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
+    _confirmed  = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+    _today_conf = [r for r in _confirmed if r.get('date') == _today_iso]
+    hdr_wins    = sum(1 for r in _today_conf if r.get('result') == 'Profit')
+    hdr_losses  = sum(1 for r in _today_conf if r.get('result') == 'Loss')
+    hdr_total   = hdr_wins + hdr_losses
+    hdr_rate    = int(hdr_wins / hdr_total * 100) if hdr_total > 0 else 0
+
+    pair_display = pair.replace('_otc', '-OTC').replace('_OTC', '-OTC').upper()
+
+    # Layout
+    ROW_H   = 27   # uniform row height
+    PAD_X   = 10
+    PAD_Y   = 12
+    GAP     = 6
+    ROWS    = 4
+    box_h   = PAD_Y + ROWS * ROW_H + (ROWS - 1) * GAP + PAD_Y
+
+    # ---- PIL icon helper functions ----
+    def draw_icon_antenna(d, cx, cy, r, col):
+        """📡 satellite dish: circle with cross-hairs + radiating arcs"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(10, 20, 50), outline=col, width=2)
+        d.line([(cx - r + 2, cy), (cx + r - 2, cy)], fill=col, width=1)
+        d.line([(cx, cy - r + 2), (cx, cy + r - 2)], fill=col, width=1)
+        d.arc([cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3], 200, 340, fill=col, width=2)
+
+    def draw_icon_target(d, cx, cy, r, col):
+        """🎯 bullseye target: concentric circles"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
+        d.ellipse([cx - r//2, cy - r//2, cx + r//2, cy + r//2], outline=col, width=2)
+        d.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=col)
+        d.line([(cx - r - 2, cy), (cx - r//2 - 1, cy)], fill=col, width=1)
+        d.line([(cx + r//2 + 1, cy), (cx + r + 2, cy)], fill=col, width=1)
+
+    def draw_icon_barchart(d, x, y, w, h, col):
+        """📊 bar chart: 3 vertical bars of different heights"""
+        bw = max(2, w // 4)
+        heights = [int(h * 0.5), int(h * 0.85), int(h * 0.65)]
+        for i, bh in enumerate(heights):
+            bx = x + i * (bw + 1)
+            d.rectangle([bx, y + h - bh, bx + bw, y + h], fill=col)
+
+    def draw_icon_clock(d, cx, cy, r, col):
+        """🕛 clock face: circle + hour hand (12 pos) + minute hand"""
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
+        d.line([(cx, cy), (cx, cy - r + 3)], fill=col, width=2)
+        d.line([(cx, cy), (cx + r - 4, cy)], fill=col, width=1)
+
+    def draw_icon_trophy(d, x, y, w, h, col):
+        """🏆 trophy: cup shape"""
+        mid = x + w // 2
+        d.rectangle([x + 2, y, x + w - 2, y + h - 4], outline=col, width=1, fill=(30, 60, 20))
+        d.rectangle([x + 1, y + 1, x + w - 1, y + 3], fill=col)
+        d.line([(mid, y + h - 4), (mid, y + h - 1)], fill=col, width=2)
+        d.line([(x + 1, y + h - 1), (x + w - 1, y + h - 1)], fill=col, width=2)
+
+    def draw_icon_checkmark(d, x, y, s, col):
+        """✅ checkmark inside box"""
+        d.rectangle([x, y, x + s, y + s], outline=col, width=2)
+        d.line([(x + 2, y + s//2), (x + s//2 - 1, y + s - 3)], fill=col, width=2)
+        d.line([(x + s//2 - 1, y + s - 3), (x + s - 2, y + 2)], fill=col, width=2)
+
+    def draw_icon_xmark(d, x, y, s, col):
+        """❌ X mark"""
+        d.line([(x + 1, y + 1), (x + s - 1, y + s - 1)], fill=col, width=2)
+        d.line([(x + s - 1, y + 1), (x + 1, y + s - 1)], fill=col, width=2)
+
+
+    def draw_icon_balance(d, cx, cy, r, col):
+        """⚖️ balance scale: horizontal bar + two hanging pans"""
+        # top center pivot point
+        d.line([(cx, cy - r), (cx, cy)], fill=col, width=2)
+        # horizontal arm
+        d.line([(cx - r, cy - r//2), (cx + r, cy - r//2)], fill=col, width=2)
+        # left pan
+        d.arc([cx - r - 3, cy - r//2 + 2, cx - r//2 + 3, cy + 2], 0, 180, fill=col, width=2)
+        # right pan
+        d.arc([cx + r//2 - 3, cy - r//2 + 2, cx + r + 3, cy + 2], 0, 180, fill=col, width=2)
+        # base
+        d.line([(cx - 3, cy), (cx + 3, cy)], fill=col, width=2)
+    def draw_icon_trend_up(d, x, y, w, h, col):
+        """📈 upward trend line"""
+        pts = [(x, y + h), (x + w//3, y + h//2), (x + 2*w//3, y + h//4), (x + w, y)]
+        for i in range(len(pts) - 1):
+            d.line([pts[i], pts[i+1]], fill=col, width=2)
+        d.polygon([
+            (x + w - 2, y - 2),
+            (x + w + 3, y + 4),
+            (x + w + 3, y - 5)
+        ], fill=col)
+
+    # ---- Measure text (plain strings, no emoji chars) ----
+    title_w  = int(draw.textlength(title_text,  font=font_large))
+    slabel_w = int(draw.textlength(f"{status_label}: ", font=font_small))
+    svalue_w = int(draw.textlength(status_value, font=font_small))
+    tf_tw    = int(draw.textlength(tf_label,    font=font_tiny))
+    pair_tw  = int(draw.textlength(pair_display, font=font_medium))
+    time_tw  = int(draw.textlength(candle_time,  font=font_medium))
+    ICON_SZ  = 14   # standard icon size
+    ic_span  = 30   # circle icon + gap
+
+    box_w = max(
+        PAD_X + ic_span + title_w + PAD_X,
+        PAD_X + 10 + ICON_SZ + 4 + slabel_w + svalue_w + tf_tw + 30 + PAD_X,
+        PAD_X + ICON_SZ + 4 + pair_tw + 18 + ICON_SZ + 4 + time_tw + PAD_X,
+        280
+    )
+
+    x1, y1 = 10, header_y
+    x2, y2 = x1 + box_w, y1 + box_h
+
+    # Outer glow border
+    draw.rectangle([x1 - 3, y1 - 3, x2 + 3, y2 + 3], outline=(0, 120, 180), width=1)
+    draw.rectangle([x1 - 2, y1 - 2, x2 + 2, y2 + 2], outline=(0, 180, 220), width=2)
+    # Main panel background
+    draw.rectangle([x1, y1, x2, y2], fill=(8, 14, 32), outline=(0, 195, 235), width=1)
+
+    # ===== ROW 1: crosshair circle icon + title =====
+    r1_y  = y1 + PAD_Y
+    ic_r  = 10
+    ic_cx = x1 + PAD_X + ic_r
+    ic_cy = r1_y + ROW_H // 2
+    draw.ellipse([ic_cx - ic_r, ic_cy - ic_r, ic_cx + ic_r, ic_cy + ic_r],
+                 fill=(10, 20, 50), outline=(0, 200, 230), width=2)
+    cs = 5
+    draw.line([(ic_cx - cs, ic_cy), (ic_cx + cs, ic_cy)], fill=(0, 200, 230), width=2)
+    draw.line([(ic_cx, ic_cy - cs), (ic_cx, ic_cy + cs)], fill=(0, 200, 230), width=2)
+    draw.text((ic_cx + ic_r + 8, r1_y + 2), title_text, fill=(255, 255, 255), font=font_large)
+
+    # ===== ROW 2: status strip with drawn icon =====
+    r2_y  = r1_y + ROW_H + GAP
+    draw.rectangle([x1 + 4, r2_y, x2 - 4, r2_y + ROW_H],
+                   fill=strip_fill, outline=strip_outline, width=1)
+    # Draw 📡 or 🎯 icon
+    icon_cx2 = x1 + 12 + ICON_SZ // 2
+    icon_cy2 = r2_y + ROW_H // 2
+    if status_icon == "antenna":
+        draw_icon_antenna(draw, icon_cx2, icon_cy2, ICON_SZ // 2, status_dot_color)
+    else:
+        draw_icon_target(draw, icon_cx2, icon_cy2, ICON_SZ // 2, status_dot_color)
+    text_x2 = x1 + 12 + ICON_SZ + 4
+    draw.text((text_x2, r2_y + 4), f"{status_label}: ", fill=(230, 230, 230), font=font_small)
+    # Draw result-value with checkmark/X icon for WIN/LOSS
+    val_x = text_x2 + slabel_w
+    if is_result and status_value == "WIN":
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+        sv_w = int(draw.textlength(status_value, font=font_small))
+        draw_icon_checkmark(draw, val_x + sv_w + 3, r2_y + 5, ICON_SZ - 4, sv_color)
+    elif is_result and status_value == "LOSS":
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+        sv_w = int(draw.textlength(status_value, font=font_small))
+        draw_icon_xmark(draw, val_x + sv_w + 3, r2_y + 5, ICON_SZ - 4, sv_color)
+    else:
+        draw.text((val_x, r2_y + 4), status_value, fill=sv_color, font=font_small)
+    # Timeframe pill  🕛
+    tf_pill_x2 = x2 - 8
+    tf_pill_x1 = tf_pill_x2 - tf_tw - ICON_SZ - 18
+    draw.rectangle([tf_pill_x1, r2_y + 3, tf_pill_x2, r2_y + ROW_H - 3],
+                   fill=(0, 55, 110), outline=(0, 160, 235), width=1)
+    clk_ic_cx = tf_pill_x1 + 6 + ICON_SZ // 2
+    clk_ic_cy = r2_y + ROW_H // 2
+    draw_icon_clock(draw, clk_ic_cx, clk_ic_cy, ICON_SZ // 2 - 1, (150, 210, 255))
+    draw.text((tf_pill_x1 + 6 + ICON_SZ + 2, r2_y + 5), tf_label, fill=(200, 235, 255), font=font_tiny)
+
+    # ===== ROW 3: 📊 pair + 🕛 time =====
+    r3_y = r2_y + ROW_H + GAP
+    draw.rectangle([x1, r3_y, x2, r3_y + ROW_H], fill=(12, 20, 42), outline=(0, 80, 120), width=1)
+    # 📊 bar-chart icon before pair
+    bar_x = x1 + PAD_X
+    bar_y = r3_y + 4
+    draw_icon_barchart(draw, bar_x, bar_y, ICON_SZ, ROW_H - 8, (100, 180, 255))
+    draw.text((bar_x + ICON_SZ + 4, r3_y + 3), pair_display, fill=(180, 220, 255), font=font_medium)
+    # 🕛 clock icon before time
+    clk_tw_plain = int(draw.textlength(candle_time, font=font_medium))
+    clk_x = x2 - PAD_X - clk_tw_plain
+    clk_ic_x = clk_x - ICON_SZ - 4
+    clk_cy3  = r3_y + ROW_H // 2
+    draw_icon_clock(draw, clk_ic_x + ICON_SZ // 2, clk_cy3, ICON_SZ // 2 - 1, (150, 210, 255))
+    draw.text((clk_x, r3_y + 3), candle_time, fill=(150, 210, 255), font=font_medium)
+
+    # ===== ROW 4: legend (signal) or stats (result) =====
+    r4_y = r3_y + ROW_H + GAP
+    draw.rectangle([x1, r4_y, x2, r4_y + ROW_H], fill=(10, 16, 36), outline=(0, 60, 100), width=1)
+    if not is_result:
+        legend_items = [
+            (f"EMA {EMA_PERIOD}", TEAL),
+            ("EMA 21",            (255, 90, 90)),
+            ("SAR",               YELLOW),
+            ("Channel",           LIGHT_GRAY),
+        ]
+        lx = x1 + PAD_X
+        for lbl, lcol in legend_items:
+            lw = int(draw.textlength(lbl, font=font_tiny))
+            if lx + lw + 14 > x2 - 4:
+                break
+            draw.ellipse([lx, r4_y + 7, lx + 7, r4_y + 14], fill=lcol)
+            draw.text((lx + 10, r4_y + 4), lbl, fill=lcol, font=font_tiny)
+            lx += 10 + lw + 8
+    else:
+        # 🏆 Wins
+        rsx = x1 + PAD_X
+        draw_icon_trophy(draw, rsx, r4_y + 4, ICON_SZ - 2, ROW_H - 8, (255, 210, 0))
+        rsx += ICON_SZ + 2
+        w_label = f"Wins: {hdr_wins}"
+        draw.text((rsx, r4_y + 4), w_label, fill=(100, 255, 140), font=font_small)
+        rsx += int(draw.textlength(w_label, font=font_small)) + 8
+        # ❌ Losses
+        draw_icon_xmark(draw, rsx, r4_y + 5, ICON_SZ - 4, (255, 80, 80))
+        rsx += ICON_SZ - 2
+        l_label = f"Losses: {hdr_losses}"
+        draw.text((rsx, r4_y + 4), l_label, fill=(255, 100, 100), font=font_small)
+        rsx += int(draw.textlength(l_label, font=font_small)) + 8
+        # 📈 Accuracy
+        draw_icon_trend_up(draw, rsx, r4_y + 5, ICON_SZ - 2, ROW_H - 10, (100, 210, 255))
+        rsx += ICON_SZ + 2
+        a_label = f"{hdr_rate}%"
+        draw.text((rsx, r4_y + 4), a_label, fill=(100, 210, 255), font=font_small)
+
+    # ===== WIN / LOSS big badge (top-right corner, result only) =====
+    if is_result and status_value in ("WIN", "LOSS"):
+        badge_w, badge_h = 120, 46
+        badge_x2 = WIDTH - 12
+        badge_x1 = badge_x2 - badge_w
+        badge_y1 = 10
+        badge_y2 = badge_y1 + badge_h
+        b_fill    = (10, 50, 10)  if status_value == "WIN" else (50, 10, 10)
+        b_outline = (0, 240, 80) if status_value == "WIN" else (240, 50, 50)
+        b_col     = (60, 255, 100) if status_value == "WIN" else (255, 80, 80)
+        # Glow layers
+        for g in range(4, 0, -1):
+            gc = tuple(max(0, c - g * 30) for c in b_outline)
+            draw.rectangle([badge_x1 - g, badge_y1 - g, badge_x2 + g, badge_y2 + g],
+                           outline=gc, width=1)
+        draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2],
+                       fill=b_fill, outline=b_outline, width=3)
+        bv_tw = int(draw.textlength(status_value, font=font_large))
+        bv_tx = badge_x1 + (badge_w - bv_tw - ICON_SZ - 4) // 2
+        bv_ty = badge_y1 + (badge_h - ROW_H) // 2
+        draw.text((bv_tx, bv_ty), status_value, fill=b_col, font=font_large)
+        ic_bx = bv_tx + bv_tw + 4
+        ic_by = bv_ty + 2
+        if status_value == "WIN":
+            draw_icon_checkmark(draw, ic_bx, ic_by, ICON_SZ + 2, b_col)
+        else:
+            draw_icon_xmark(draw, ic_bx, ic_by, ICON_SZ + 2, b_col)
+    # --- চার্ট এরিয়া ডিফাইন ---
+    CHART_AREA_LEFT = 72         # left margin for price axis
+    CHART_AREA_TOP = 162          # top margin
+    CHART_AREA_WIDTH = WIDTH - CHART_AREA_LEFT - 15   # nearly full width
+    CHART_AREA_HEIGHT = HEIGHT - CHART_AREA_TOP - 45  # leave space for time labels
+    # No border drawn - clean open chart like reference image
+    
+    # প্রাইস স্কেলিং
+    all_prices = [c['high'] for c in candles] + [c['low'] for c in candles]
+    min_price = min(all_prices) * 0.9998
+    max_price = max(all_prices) * 1.0002
+    price_range = max_price - min_price
+
+    if price_range == 0:
+        price_range = max_price * 0.001
+
+    def scale_price_to_y(price):
+        return CHART_AREA_TOP + CHART_AREA_HEIGHT - int(
+            (price - min_price) / price_range * CHART_AREA_HEIGHT
+        )
+    
+    # --- প্রাইস স্কেল সেকশন (বাম পাশে) - reference style: no background box ---
+    if SHOW_PRICE_SCALE:
+        price_values = np.linspace(min_price, max_price, 8)
+        for i, price in enumerate(price_values):
+            y_pos = scale_price_to_y(price)
+            price_str = f"{price:.4f}" if price < 1 else f"{price:.4f}"
+            tw = draw.textlength(price_str, font=font_tiny)
+            # Right-align price text just before chart area
+            draw.text((CHART_AREA_LEFT - tw - 6, y_pos - 7), price_str, fill=LIGHT_GRAY, font=font_tiny)
+    
+    # --- SNR লাইন ড্রয়িং (নতুন) ---
+    if SNR_LINES:
+        closes = [c['close'] for c in candles]
+        snr_levels = calculate_snr_levels(closes, num_levels=5)
+        
+        for level_data in snr_levels:
+            y_snr = scale_price_to_y(level_data['level'])
+            color = SUPPORT_COLOR if level_data['type'] == 'SUPPORT' else RESISTANCE_COLOR
+            
+            # Draw SNR line
+            draw.line([(CHART_AREA_LEFT, y_snr), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y_snr)], 
+                     fill=color, width=2)
+            
+            # Draw label
+            label_text = f"{level_data['type'][0]}: {level_data['level']:.5f}"
+            draw.text((CHART_AREA_LEFT + 5, y_snr - 15), 
+                     label_text, fill=color, font=font_tiny)
+    
+    # --- সুপারট্রেন্ড লাইন ড্রয়িং (নতুন) ---
+    if SUPERTREND_CHART:
+        supertrend_values, trend_values = calculate_supertrend(candles, period=10, multiplier=3)
+        
+        if supertrend_values and trend_values:
+            supertrend_points = []
+            for i, value in enumerate(supertrend_values):
+                if value is not None and i < min(len(candles), 50):
+                    x_st = CHART_AREA_LEFT + int(i * CHART_AREA_WIDTH / min(len(candles), 50))
+                    y_st = scale_price_to_y(value)
+                    supertrend_points.append((x_st, y_st))
+            
+            # Draw Supertrend line
+            if len(supertrend_points) > 1:
+                for j in range(1, len(supertrend_points)):
+                    color = SUPERTREND_UP_COLOR if trend_values[j] == 1 else SUPERTREND_DOWN_COLOR
+                    draw.line([supertrend_points[j-1], supertrend_points[j]], 
+                             fill=color, width=2)
+    
+    # --- EMA লাইন ড্রয়িং (নতুন) ---
+    if EMA_LINE_CHART:
+        closes = [c['close'] for c in candles]
+        ema_value = ema(closes, EMA_PERIOD)
+        
+        if ema_value is not None:
+            y_ema = scale_price_to_y(ema_value)
+            draw.line([(CHART_AREA_LEFT, y_ema), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y_ema)], 
+                     fill=EMA_COLOR, width=3)
+            
+            # Label at right end
+            draw.text((CHART_AREA_LEFT + CHART_AREA_WIDTH - 60, y_ema - 15), 
+                     f"EMA{EMA_PERIOD}", fill=EMA_COLOR, font=font_tiny)
+    
+    # --- FVG গ্যাপ ড্রয়িং (নতুন) ---
+    if FVG_GAP_DRAW:
+        fvg_gaps = detect_fvg_gaps(candles)
+        for gap in fvg_gaps:
+            if gap['candle_index'] < min(len(candles), 50):
+                x_fvg = CHART_AREA_LEFT + int(gap['candle_index'] * CHART_AREA_WIDTH / min(len(candles), 50))
+                y_start = scale_price_to_y(gap['start_price'])
+                y_end = scale_price_to_y(gap['end_price'])
+                
+                # Draw FVG area
+                draw.rectangle([x_fvg - 10, min(y_start, y_end),
+                               x_fvg + 10, max(y_start, y_end)],
+                              fill=FVG_COLOR, outline=YELLOW)
+                
+                # Draw label
+                label_text = "FVG"
+                draw.text((x_fvg - 15, (y_start + y_end) // 2 - 10), 
+                         label_text, fill=YELLOW, font=font_tiny)
+    
+    # --- GAP ড্রয়িং (নতুন) ---
+    if GAP_DRAWING:
+        gaps = calculate_gaps(candles)
+        for gap in gaps:
+            gap_y_start = scale_price_to_y(gap['start_price'])
+            gap_y_end = scale_price_to_y(gap['end_price'])
+            
+            # Calculate x position for gap
+            if gap['candle_index'] < len(candles):
+                x_gap = CHART_AREA_LEFT + int(gap['candle_index'] * CHART_AREA_WIDTH / min(len(candles), 50))
+                
+                # Draw gap area
+                draw.rectangle([x_gap - 5, min(gap_y_start, gap_y_end),
+                               x_gap + 5, max(gap_y_start, gap_y_end)],
+                              fill=GAP_COLOR, outline=YELLOW)
+    
+    # --- রিভার্স এরিয়া ড্রয়িং (নতুন) ---
+    if REVERSE_AREA_DRAWING:
+        reversal_areas = detect_reversal_areas(candles)
+        for area in reversal_areas:
+            if area['candle_index'] < len(candles):
+                x_rev = CHART_AREA_LEFT + int(area['candle_index'] * CHART_AREA_WIDTH / min(len(candles), 50))
+                y_rev = scale_price_to_y(area['price'])
+                
+                # Draw reversal marker
+                if area['type'] == 'SWING_HIGH':
+                    # Triangle pointing down for swing high
+                    draw.polygon([(x_rev, y_rev - 10), (x_rev - 8, y_rev), (x_rev + 8, y_rev)],
+                                fill=RED, outline=RED)
+                elif area['type'] == 'SWING_LOW':
+                    # Triangle pointing up for swing low
+                    draw.polygon([(x_rev, y_rev + 10), (x_rev - 8, y_rev), (x_rev + 8, y_rev)],
+                                fill=GREEN, outline=GREEN)
+    
+    # --- প্যারাবলিক SAR লাইন (নতুন) ---
+    if PARABOLIC_SAR_LINES:
+        sar_values = calculate_parabolic_sar(candles)
+        if sar_values and len(sar_values) == len(candles):
+            sar_points = []
+            for i, sar in enumerate(sar_values):
+                if i < min(len(candles), 50):  # Limit to visible candles
+                    x_sar = CHART_AREA_LEFT + int(i * CHART_AREA_WIDTH / min(len(candles), 50))
+                    y_sar = scale_price_to_y(sar)
+                    sar_points.append((x_sar, y_sar))
+            
+            # Draw SAR points
+            for point in sar_points:
+                draw.ellipse([point[0] - 3, point[1] - 3, point[0] + 3, point[1] + 3],
+                           fill=PARABOLIC_SAR_COLOR, outline=WHITE)
+    
+    # --- সাপোর্ট/রেজিস্ট্যান্স লাইন (স্পষ্ট করে) ---
+    if SUPPORT_RESISTANCE_LINES:
+        support, resistance, pivot, r1, s1 = calculate_support_resistance(candles)
+        
+        if support and resistance:
+            # Support Line (thicker and more visible)
+            y_support = scale_price_to_y(support)
+            draw.line([(CHART_AREA_LEFT, y_support), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y_support)], 
+                     fill=SUPPORT_COLOR, width=3)
+            draw.text((CHART_AREA_LEFT + 5, y_support - 20), 
+                     f"S: {support:.5f}", fill=SUPPORT_COLOR, font=font_small)
+            
+            # Resistance Line (thicker and more visible)
+            y_resistance = scale_price_to_y(resistance)
+            draw.line([(CHART_AREA_LEFT, y_resistance), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y_resistance)], 
+                     fill=RESISTANCE_COLOR, width=3)
+            draw.text((CHART_AREA_LEFT + 5, y_resistance + 5), 
+                     f"R: {resistance:.5f}", fill=RESISTANCE_COLOR, font=font_small)
+    
+    # --- মুভিং এভারেজ লাইন (স্পষ্ট) ---
+    if MOVING_AVERAGE_LINES:
+        ma_values = calculate_moving_averages(candles, periods=[20, 50, 100, 200])
+        
+        for i, (period, ma_value) in enumerate(ma_values.items()):
+            if ma_value:
+                y_ma = scale_price_to_y(ma_value)
+                color = MA_COLORS[i % len(MA_COLORS)]
+                draw.line([(CHART_AREA_LEFT, y_ma), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y_ma)], 
+                         fill=color, width=3)
+                
+                # Label at right end
+                draw.text((CHART_AREA_LEFT + CHART_AREA_WIDTH - 60, y_ma - 15), 
+                         f"MA{period}", fill=color, font=font_tiny)
+    
+    # --- ট্রেন্ড লাইন (স্পষ্ট) ---
+    if TREND_LINES and len(candles) > 10:
+        x_vals = list(range(len(candles)))
+        y_vals = [c['close'] for c in candles]
+        if len(y_vals) > 1:
+            x1 = CHART_AREA_LEFT
+            y1 = scale_price_to_y(y_vals[0])
+            x2 = CHART_AREA_LEFT + CHART_AREA_WIDTH
+            y2 = scale_price_to_y(y_vals[-1])
+            draw.line([(x1, y1), (x2, y2)], fill=TREND_LINE_COLOR, width=3)
+            draw.text((x2 - 50, y2 - 20), "TREND", fill=TREND_LINE_COLOR, font=font_small)
+    
+    # --- গ্রিড লাইন - very subtle, exactly like reference image ---
+    # Always draw grid (reference always shows subtle grid)
+    for i in range(9):  # 8 horizontal lines matching price levels
+        y = CHART_AREA_TOP + int(i * CHART_AREA_HEIGHT / 8)
+        draw.line([(CHART_AREA_LEFT, y), (CHART_AREA_LEFT + CHART_AREA_WIDTH, y)],
+                 fill=GRID_COLOR, width=1)
+    num_v_lines = 10
+    for i in range(num_v_lines):
+        x = CHART_AREA_LEFT + int(i * CHART_AREA_WIDTH / (num_v_lines - 1))
+        draw.line([(x, CHART_AREA_TOP), (x, CHART_AREA_TOP + CHART_AREA_HEIGHT)],
+                 fill=GRID_COLOR, width=1)
+    if SHOW_GRID_LINES:
+        pass  # already drawn above
+    
+    # --- ক্যান্ডেল আঁকা - fill full chart width like reference image ---
+    num_candles_to_show = min(len(candles), 30)
+    actual_num_candles = min(len(candles), num_candles_to_show)
+    
+    # Calculate candle width so they fill the full chart area
+    ideal_spacing = 4
+    # Candles fill all available width
+    candle_width = max(8, (CHART_AREA_WIDTH - ideal_spacing) // actual_num_candles - ideal_spacing)
+    spacing = max(2, (CHART_AREA_WIDTH - actual_num_candles * candle_width) // max(1, actual_num_candles))
+    
+    # Start from left edge of chart area
+    start_x_offset = CHART_AREA_LEFT + (candle_width // 2)
+
+    last_candle_center = None
+    last_candle_y_top = None
+    last_candle_radius = candle_width // 2 + 8
+    last_candle_x = None
+
+    for i in range(actual_num_candles):
+        x_center = start_x_offset + i * (candle_width + spacing)
+        x_left = x_center - (candle_width // 2)
+        x_right = x_center + (candle_width // 2)
+        
+        if x_center > CHART_AREA_LEFT + CHART_AREA_WIDTH:
+            break
+        
+        candle = candles[i]
+        
+        y_high = scale_price_to_y(candle['high'])
+        y_low = scale_price_to_y(candle['low'])
+        
+        is_bullish = candle['close'] > candle['open']
+        body_color = GREEN if is_bullish else RED
+        wick_color = body_color
+        
+        # Wick - thin line
+        draw.line([(x_center, y_high), (x_center, y_low)], fill=wick_color, width=1)
+        
+        y_open = scale_price_to_y(candle['open'])
+        y_close = scale_price_to_y(candle['close'])
+        y_top = min(y_open, y_close)
+        y_bottom = max(y_open, y_close)
+        body_height = max(2, y_bottom - y_top)
+        
+        # Candle body - solid filled rectangle
+        draw.rectangle([x_left, y_top, x_right, y_bottom],
+                       fill=body_color, outline=body_color)
+        
+        if i == actual_num_candles - 1:
+            last_candle_center = (x_center, (y_top + y_bottom) // 2)
+            last_candle_y_top = y_top
+            last_candle_x = x_right
+    
+    # --- Signal indicator near last candle (like reference image: ↑ CALL) ---
+    if last_candle_x is not None and last_candle_y_top is not None:
+        arrow = "↑" if sig_text == 'CALL' else "↓"
+        sig_full = f"{arrow} {sig_text}"
+        sig_x_pos = last_candle_x + 6
+        sig_y_pos = last_candle_y_top - 4
+        # Clamp to chart right edge
+        sig_tw = draw.textlength(sig_full, font=font_small)
+        if sig_x_pos + sig_tw > WIDTH - 5:
+            sig_x_pos = WIDTH - int(sig_tw) - 8
+        draw.text((sig_x_pos, sig_y_pos), sig_full, fill=sig_color, font=font_small)
+    
+    # No footer text.
+    
+    # --- Mark Result Candle if ON and result is provided ---
+    if MARK_RESULT_CANDLE and result and last_candle_center:
+        mark_color = GREEN if result == 'Profit' else RED
+        # Draw circle around last candle
+        draw.ellipse([last_candle_center[0] - last_candle_radius, last_candle_center[1] - last_candle_radius,
+                      last_candle_center[0] + last_candle_radius, last_candle_center[1] + last_candle_radius],
+                     outline=mark_color, width=3)
+        
+        # Add result text with solid background
+        result_text = "WIN" if result == 'Profit' else "LOSS"
+        text_width = draw.textlength(result_text, font=font_medium)
+        draw.rectangle([last_candle_center[0] - text_width//2 - 5, last_candle_center[1] - 40,
+                        last_candle_center[0] + text_width//2 + 5, last_candle_center[1] - 20],
+                       fill=mark_color)
+        draw.text((last_candle_center[0] - text_width//2, last_candle_center[1] - 37), 
+                  result_text, fill=(0, 0, 0), font=font_medium)
+
+    # Right-side result badge — PIL shapes only (no emoji, fully Pillow-compatible)
+    if result:
+        if result == "Profit":
+            main_text        = "MTG WIN" if "MTG" in (caption or "").upper() else "WIN"
+            badge_icon       = "check"
+            badge_fill       = (10, 80, 30)
+            badge_outline    = (40, 200, 80)
+            badge_text_color = (200, 255, 210)
+        elif result == "Loss":
+            main_text        = "LOSS"
+            badge_icon       = "xmark"
+            badge_fill       = (100, 15, 15)
+            badge_outline    = (220, 55, 55)
+            badge_text_color = (255, 210, 210)
+        else:
+            main_text        = "MTG WIN" if "MTG" in (caption or "").upper() else "BE"
+            badge_icon       = "balance"
+            badge_fill       = (90, 70, 5)
+            badge_outline    = (220, 190, 30)
+            badge_text_color = (255, 240, 170)
+
+        _ICON_SZ_B = 22
+        main_tw   = int(draw.textlength(main_text, font=font_large))
+        b_pad     = 16
+        b_height  = 52
+        main_bw   = main_tw + b_pad * 2
+        icon_bw   = _ICON_SZ_B + b_pad
+        total_w   = main_bw + 4 + icon_bw
+
+        bx2 = WIDTH - 12
+        bx1 = bx2 - total_w
+        by1 = 12
+        by2 = by1 + b_height
+
+        # Outer border
+        draw.rectangle([bx1 - 2, by1 - 2, bx2 + 2, by2 + 2],
+                       outline=badge_outline, width=2)
+        # Main label box
+        draw.rectangle([bx1, by1, bx1 + main_bw, by2],
+                       fill=badge_fill, outline=badge_outline, width=1)
+        draw.text((bx1 + b_pad, by1 + (b_height - 28) // 2),
+                  main_text, fill=badge_text_color, font=font_large)
+        # Icon sub-box
+        cbx1 = bx1 + main_bw + 4
+        cbx2 = bx2
+        draw.rectangle([cbx1, by1, cbx2, by2],
+                       fill=badge_fill, outline=badge_outline, width=1)
+        ic_cx_b = cbx1 + (cbx2 - cbx1) // 2
+        ic_cy_b = by1 + b_height // 2
+        ic_r_b  = _ICON_SZ_B // 2
+        if badge_icon == "check":
+            draw_icon_checkmark(draw, ic_cx_b - ic_r_b, ic_cy_b - ic_r_b, _ICON_SZ_B, badge_text_color)
+        elif badge_icon == "xmark":
+            draw_icon_xmark(draw, ic_cx_b - ic_r_b, ic_cy_b - ic_r_b, _ICON_SZ_B, badge_text_color)
+        else:
+            draw_icon_balance(draw, ic_cx_b, ic_cy_b, ic_r_b, badge_text_color)
+    # Footer watermark removed.
+    
+    # ইমেজ সেভ
+    buffer = BytesIO()
+    img.save(buffer, format="PNG", quality=95)
+    buffer.seek(0)
+    return buffer
+
+def calculate_support_resistance(candles, lookback=20):
+    """সাপোর্ট এবং রেজিস্ট্যান্স লেভেল ক্যালকুলেট করে"""
+    if len(candles) < lookback:
+        return None, None, None, None, None
+    
+    recent_candles = candles[-lookback:]
+    highs = [c['high'] for c in recent_candles]
+    lows = [c['low'] for c in recent_candles]
+    
+    # Simple support and resistance
+    resistance = max(highs)
+    support = min(lows)
+    
+    # Additional levels (optional)
+    pivot = (resistance + support) / 2
+    r1 = 2 * pivot - support
+    s1 = 2 * pivot - resistance
+    
+    return support, resistance, pivot, r1, s1
+
+def calculate_moving_averages(candles, periods=[20, 50, 100, 200]):
+    """মুভিং এভারেজ ক্যালকুলেট করে"""
+    closes = [c['close'] for c in candles]
+    ma_values = {}
+    
+    for period in periods:
+        if len(closes) >= period:
+            ma_values[period] = ema(closes, period)
+    
+    return ma_values
+
+# ================= ক্যান্ডেল ফেচিং ফাংশন =================
+
+async def safe_fetch(q, pair, period):
+    try:
+        r = await asyncio.wait_for(q.get_candles(pair, time.time(), MAX_CANDLES, period), timeout=10)
+        if r:
+            return r
+    except:
+        pass
+
+    try:
+        r = await asyncio.wait_for(q.get_candle_v2(pair, period, MAX_CANDLES), timeout=10)
+        if r:
+            return r
+    except:
+        pass
+    return None
+
+async def get_candles_for_chart(q: Quotex, pair: str, period: int):
+    raw = await safe_fetch(q, pair, period)
+
+    if not raw:
+        return []
+
+    candles = []
+    for r in raw:
+        ts = r.get("time") or r.get("timestamp") or r.get("t") or r.get("date")
+        dt = ts_to_dt(ts)
+        if dt is None:
+            continue
+
+        open_price = float(r.get("open") or r.get("o", 0))
+        close_price = float(r.get("close") or r.get("c", 0))
+
+        signal = "CALL" if close_price > open_price else "PUT"
+
+        candles.append({
+            "dt": dt,
+            "open": open_price,
+            "high": float(r.get("high") or r.get("h", 0)),
+            "low": float(r.get("low") or r.get("l", 0)),
+            "close": close_price,
+            "volume": int(r.get("volume") or r.get("v", 0)),
+            "signal": signal
+        })
+
+    candles.sort(key=lambda x: x["dt"])
+
+    if len(candles) > MAX_CANDLES:
+        candles = candles[-MAX_CANDLES:]
+
+    return candles
+
+# ================= সিগন্যাল প্রক্রিয়াকরণ ফাংশন (আপডেট: MTG রেজাল্ট + অ্যাডভান্সড অ্যানালাইসিস) =================
+async def _pre_analyze_next(client):
+    """Placeholder – pre-analysis disabled to prevent concurrent WebSocket access."""
+    # Using the Quotex client here while process_signal is also using it
+    # causes concurrent WebSocket requests that corrupt connection state and
+    # make the bot freeze after 1-2 signals. The normal send_signal flow
+    # will analyze pairs fresh after each result is posted.
+    try:
+        await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+
+
+async def process_signal(client, pair, direction, data):
+    """Process a signal, generate chart, and handle martingale"""
+    global SEND_PHOTO_WITH_SIGNAL, CHART_BACKGROUND_IMAGE_PATH, SIGNAL_USERNAME, SIGNAL_HEADER_TEXT, last_signal_time, next_signal_interval, RESULT_FOOTER_TEXT
+    global ADVANCED_ANALYSIS, CUSTOM_LINK
+
+    # --- চার্ট ডেটা আনা ---
+    if SEND_PHOTO_WITH_SIGNAL:
+        chart_candles = await get_candles_for_chart(client, pair, TIMEFRAME)
+    else:
+        chart_candles = None
+    # --- চার্ট ডেটা আনা ---
+
+    # **সিগন্যাল পাঠানোর আগে JSON-এ সেভ করা হবে না**
+    try:
+        def _ready_next_signal_now():
+            # Allow scheduler to dispatch the next signal immediately after result post.
+            global last_signal_time, next_signal_interval
+            last_signal_time = 0
+            next_signal_interval = 0
+
+        def _fmt_pct(value):
+            return f"{value:.1f}".rstrip("0").rstrip(".")
+
+        def _build_result_caption(asset_name, signal_time, wins_count, losses_count, title_text, show_direction=False, direction_icon="🟢", direction_label="CALL"):
+            total_cnt = wins_count + losses_count
+            win_rate = (wins_count / total_cnt * 100) if total_cnt > 0 else 0
+            if show_direction:
+                d_text = "𝗖𝗔𝗟𝗟" if direction_label.upper() == "CALL" else "𝗣𝗨𝗧"
+                return f"""<b>𒆜•——‼️ 𝚁 | 𝙴 | 𝚂 | 𝚄 | 𝙻 | 𝚃 ‼️——•𒆜
+
+╭━━━━━━━━━・━━━━━━━━━╮
+🚀𝙰𝚂𝚂𝙴𝚃            ☞ {asset_name}
+⏰𝚃𝙸𝙼𝙴               ☞ {signal_time}
+🎯𝙳𝙸𝚁𝙴𝙲𝚃𝙸𝙾𝙽 ☞ {direction_icon} {d_text}
+╰━━━━━━━━━・━━━━━━━━━╯
+{title_text}
+╭━━━━━━━━━・━━━━━━━━━╮
+🏆 𝚆𝚒𝚗: {wins_count}    |  𝙻𝚘𝚜𝚜: {losses_count} • {_fmt_pct(win_rate)}%
+╰━━━━━━━━━・━━━━━━━━━╯</b>
+
+{RESULT_FOOTER_TEXT}"""
+            return f"""<b>𒆜•——‼️ 𝚁 | 𝙴 | 𝚂 | 𝚄 | 𝙻 | 𝚃 ‼️——•𒆜
+
+╭━━━━━━━━𖥠━━━━━━━━╮
+📊 {asset_name}    | 🕓 {signal_time}
+╰━━━━━━━━𖥠━━━━━━━━╯
+{title_text}
+╭━━━━━━━━𖥠━━━━━━━━╮
+🚀 𝚆𝚒𝚗:{wins_count} ┃✖️𝙻𝚘𝚜𝚜:{losses_count} ◈ {_fmt_pct(win_rate)}%
+╰━━━━━━━━𖥠━━━━━━━━╯</b>
+
+🌐𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖: {SIGNAL_USERNAME}
+{RESULT_FOOTER_TEXT}"""
+
+        server_now = get_timestamp()
+        
+        # পরবর্তী ক্যান্ডেলের সময় নির্ধারণ (বর্তমান সময়ের পরবর্তী মিনিটের শুরু)
+        current_dt = datetime.now(pytz.timezone('Asia/Dhaka'))
+        next_minute_dt = current_dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        entry_ts = int(next_minute_dt.timestamp())  # এন্ট্রি ক্যান্ডেলের শুরু
+
+        # প্রদর্শনের সময় (UTC+6) ফরম্যাট করুন
+        disp_dt = next_minute_dt
+        now_str = disp_dt.strftime("%H:%M")
+
+        formatted_time = now_str
+
+        clean_asset = pair.replace('_', '—').upper()
+
+        direction_symbol = "🔴" if direction == "put" else "🟢"
+        direction_text = "𝙿𝚄𝚃" if direction == "put" else "𝙲𝙰𝙻𝙻"
+
+        # Get correct price from the last candle data
+        try:
+            # Make sure we're using the correct price from the analyzed data
+            if data and len(data) > 0:
+                price_val = float(data[-1]['close'])  # সঠিক পেয়ারের লাস্ট ক্লোজ প্রাইস
+            else:
+                # Fallback to current chart data if available
+                if chart_candles and len(chart_candles) > 0:
+                    price_val = float(chart_candles[-1]['close'])
+                else:
+                    price_val = 0.0
+        except Exception as e:
+            print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚐𝚎𝚝𝚝𝚒𝚗𝚐 𝚙𝚛𝚒𝚌𝚎: {e}"))
+            price_val = 0.0
+
+        price_str = f"{price_val:.5f}"
+        price_digits = {"0":"𝟶","1":"𝟷","2":"𝟸","3":"𝟹","4":"𝟺","5":"𝟻","6":"𝟼","7":"𝟽","8":"𝟾","9":"𝟿",".":"."}
+        formatted_price = "".join(price_digits.get(ch, ch) for ch in price_str)
+
+        # অ্যাডভান্সড অ্যানালাইসিস সেকশন
+        advanced_section = ""
+        if ADVANCED_ANALYSIS and data:
+            # ট্রেন্ড অ্যানালাইসিস
+            trend, reversal_signal, support_level, resistance_level, logic = analyze_trend_reversal(data)
+            
+            # ট্রেন্ড টেক্সট ফরম্যাট
+            trend_text = ""
+            if trend == "UP_TREND":
+                trend_text = "𝚄𝙿 𝚃𝚁𝙴𝙽𝙳"
+            elif trend == "DOWN_TREND":
+                trend_text = "𝙳𝙾𝚆𝙽 𝚃𝚁𝙴𝙽𝙳"
+            else:
+                trend_text = "𝚂𝙸𝙳𝙴𝚆𝚈𝚂"
+            
+            # রেজিস্ট্যান্স এবং সাপোর্ট ফরম্যাট
+            resistance_text = f"{resistance_level:.5f}" if resistance_level else "𝙽/𝙰"
+            support_text = f"{support_level:.5f}" if support_level else "𝙽/𝙰"
+            
+            # লজিক টেক্সট
+            logic_text = logic if logic else "𝚃𝚛𝚎𝚗𝚍 𝙵𝚘𝚕𝚕𝚘𝚠"
+            
+            # যদি রিভার্স সিগন্যাল থাকে
+            if reversal_signal == "POTENTIAL_DOWN_REVERSAL":
+                direction_text = "𝙿𝚄𝚃 (𝚁𝙴𝚅𝚄𝚁𝚂𝙴)"
+                logic_text = "𝚁𝚎𝚟𝚎𝚛𝚜𝚊𝚕 𝚊𝚝 𝚁𝚎𝚜𝚒𝚜𝚝𝚊𝚗𝚌𝚎"
+            elif reversal_signal == "POTENTIAL_UP_REVERSAL":
+                direction_text = "𝙲𝙰𝙻𝙻 (𝚁𝙴𝚅𝚄𝚁𝚂𝙴)"
+                logic_text = "𝚁𝚎𝚟𝚎𝚛𝚜𝚊𝚕 𝚊𝚝 𝚂𝚞𝚙𝚙𝚘𝚛𝚝"
+            
+            advanced_section = f"""
+╔═━━━━━━━ ◥◣◆◢◤ ━━━━━━━═╗
+📈 »» {trend_text}
+🔺 »» 𝚁𝙴𝚂𝙸𝚂𝚃𝙰𝙽𝙲𝙴 {resistance_text}
+🔹 »» SUPPORT {support_text}
+⚖️ »» {logic_text}
+╚═━━━━━━━ ◢◤◆◥◣ ━━━━━━━═╝"""
+        
+        # কাস্টম লিংক সেকশন
+        link_section = ""
+        if CUSTOM_LINK:
+            # HTML লিংক ফরম্যাট
+            link_section = f'🔗 <a href="{CUSTOM_LINK}">𝙲𝚁𝙴𝙰𝚃𝙴 𝙰𝙲𝙲𝙾𝚄𝙽𝚃 𝚀𝚇</a>'
+        else:
+            link_section = "🔗 𝙲𝚁𝙴𝙰𝚃𝙴 𝙰𝙲𝙲𝙾𝚄𝙽𝚃 𝚀𝚇"
+
+        raw_confidence = 66
+        try:
+            if isinstance(data, dict):
+                raw_confidence = data.get("confidence", data.get("score", 66))
+            elif isinstance(data, list) and data and isinstance(data[-1], dict):
+                raw_confidence = data[-1].get("confidence", data[-1].get("score", 66))
+        except:
+            raw_confidence = 66
+
+        confidence_pct = 66
+        try:
+            conf_val = float(raw_confidence)
+            if conf_val <= 1:
+                conf_val *= 100
+            elif conf_val <= 10:
+                conf_val *= 10
+            confidence_pct = int(max(50, min(99, round(conf_val))))
+        except:
+            pass
+
+        msg = f"""<b>🚧 {SIGNAL_HEADER_TEXT} 🚧
+
+╔════════💠════════╗
+📊 𝙿𝙰𝙸𝚁             ⊱  {clean_asset}
+⌛ 𝚃𝙸𝙼𝙴𝙵𝚁𝙰𝙼𝙴 ⊱  𝙼𝟷
+🎯 𝙰𝙲𝚃𝙸𝙾𝙽        ⊱  {'𝙲𝙰𝙻𝙻 🟢' if direction == 'call' else '𝙿𝚄𝚃 🔴'}
+🕒 𝙴𝙽𝚃𝚁𝚈 𝚃𝙸𝙼𝙴 ⊱  {formatted_time}
+╚════════💠════════╝
+⚙️ 𝚂𝚃𝙰𝚃𝚄𝚂 : 𝗧𝗥𝗔𝗗𝗘 𝗦𝗘𝗡𝗧 𝗦𝗨𝗖𝗖𝗘𝗦𝗦𝙵𝗨𝗟𝗟𝗬</b>
+🌐𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖: {SIGNAL_USERNAME}"""
+
+        # প্রাথমিক সিগন্যাল পাঠানোর লজিক
+        await send_telegram_photo_or_chart(msg, pair, chart_candles, signal_direction=direction.upper(), entry_time=formatted_time)
+
+        # Start pre-analyzing next signal in background during the candle wait.
+        # This runs during the idle 65s sleep — no concurrent client access.
+        _pre_task = asyncio.create_task(_pre_analyze_next(client))
+
+
+        # ট্রেড ডেটা তৈরি, কিন্তু JSON এ সেভ হবে না।
+        trade_data = {
+            'pair': pair, 'pair_display': clean_asset, 'direction': direction,
+            'signal_time': formatted_time,  # পরবর্তী ক্যান্ডেলের সময় ব্যবহার করুন
+            'signal_timestamp': entry_ts,  # টাইমস্ট্যাম্প যোগ করুন
+            'price': price_val, 'result': None,
+            'profit': None, 'martingale_step': 0, 'timestamp': server_now,
+            'date': datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
+        }
+        trade_results.append(trade_data) # শুধু মেমোরিতে যোগ করা হলো
+
+        # এন্ট্রি ক্যান্ডেলের শুরু পর্যন্ত অপেক্ষা
+        current_time = time.time()
+        wait_to_entry_start = max(0, entry_ts - current_time)
+        if wait_to_entry_start > 0:
+            await asyncio.sleep(wait_to_entry_start)
+
+        # এখন এন্ট্রি ক্যান্ডেল (22:53) চলছে, এর শেষ পর্যন্ত অপেক্ষা (60 সেকেন্ড)
+        await asyncio.sleep(65)
+
+        # Cancel pre-analysis before using client for result candle fetch.
+        if not _pre_task.done():
+            _pre_task.cancel()
+            try:
+                await _pre_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Smart result candle lookup - flexible timestamp matching
+        result_candle = None
+        _all_candidates = []
+        for _attempt in range(30):
+            _data = await asyncio.wait_for(get_candles(client, pair, TIMEFRAME), timeout=15)
+            if _data and len(_data) >= 1:
+                for candle in _data:
+                    cand_ts = candle.get('timestamp')
+                    if cand_ts:
+                        # Start-based: timestamp = candle open time
+                        if entry_ts - 5 <= cand_ts <= entry_ts + 65:
+                            _all_candidates.append((abs(cand_ts - entry_ts), candle))
+                        # End-based: timestamp = candle close time
+                        elif entry_ts + 55 <= cand_ts <= entry_ts + 125:
+                            _all_candidates.append((abs(cand_ts - (entry_ts + 60)), candle))
+                if _all_candidates:
+                    break
+            await asyncio.sleep(3)
+
+        if _all_candidates:
+            _all_candidates.sort(key=lambda x: x[0])
+            result_candle = _all_candidates[0][1]
+            print(rainbow_text(f"\u2705 Result candle: open={result_candle.get('open'):.5f} close={result_candle.get('close'):.5f} ts={result_candle.get('timestamp')}"))
+
+        # Fallback: use second-to-last candle (the one that just closed)
+        if result_candle is None:
+            _data = await asyncio.wait_for(get_candles(client, pair, TIMEFRAME), timeout=15)
+            if _data and len(_data) >= 2:
+                result_candle = _data[-2]
+                print(rainbow_text("\u26a0\ufe0f Fallback: using second-last candle as result candle"))
+        if result_candle is None:
+            send_telegram_message("⚠️ 𝙲𝚘𝚞𝚍 𝚗𝚘𝚝  𝚛𝚎𝚜𝚞𝚕𝚝 𝚌𝚊𝚗𝚍𝚕𝚎.")
+            # যদি রেজাল্ট ক্যান্ডেল না পাওয়া যায়, তবে মেমোরি থেকে সরিয়ে দেওয়া হবে
+            if trade_results and trade_results[-1]['timestamp'] == server_now:
+                trade_results.pop()
+            return
+
+        result_open = float(result_candle.get('open', price_val))
+        result_close = float(result_candle.get('close', price_val))
+
+        # রেজাল্ট নির্ধারণ (22:53 ক্যান্ডেল)
+        first_win = (direction == 'put' and result_close < result_open) or (direction == 'call' and result_close > result_open)
+        first_equal = abs(result_close - result_open) < 0.00001
+
+        # স্ট্যাটস: সব ব্রাঞ্চে ব্যবহারযোগ্য (wins_before/losses_before সবসময় ডিফাইন্ড থাকবে)
+        _shared_confirmed = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+        _shared_today = [r for r in _shared_confirmed if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+        wins_before = sum(1 for t in _shared_today if t.get('result') == 'Profit')
+        losses_before = sum(1 for t in _shared_today if t.get('result') == 'Loss')
+
+        if first_equal:
+            trade_results[-1]['result'] = 'Break-even'
+            trade_results[-1]['profit'] = 0.0
+            # **এখন সেভ করি কারণ রেজাল্ট নিশ্চিত**
+            save_trade_results()
+            print(rainbow_text(f"𝚃𝚛𝚊𝚍𝚎  {clean_asset} 𝚊𝚝 {formatted_time} 𝚎𝚗𝚍𝚎𝚍 𝚒𝚗 𝙱𝚛𝚎𝚊𝚔-𝚎𝚟𝚎𝚗."))
+            # ব্রেক-ইভেন রেজাল্ট মেসেজ
+            # শুধুমাত্র নিশ্চিত ট্রেড গণনা
+            confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+            today_trades = [r for r in confirmed_trades if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+            
+            wins_before = sum(1 for t in today_trades if t.get('result') == 'Profit')
+            losses_before = sum(1 for t in today_trades if t.get('result') == 'Loss')
+            
+            result_msg = _build_result_caption(
+                clean_asset, formatted_time, wins_before, losses_before,
+                "⚖️⚖️⚖️ 𝗕𝗥𝗘𝗔𝗞-𝗘𝗩𝗘𝗡 ⚖️⚖️⚖️"
+            )
+
+            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even', signal_direction=direction.upper(), entry_time=formatted_time)
+            _ready_next_signal_now()
+            return
+
+        # --- চার্ট ডেটা আপডেট ---
+        if SEND_PHOTO_WITH_SIGNAL:
+            chart_candles = await get_candles_for_chart(client, pair, TIMEFRAME)
+        else:
+            chart_candles = None
+        # --- চার্ট ডেটা আপডেট ---
+
+        if first_win:
+            # WIN লজিক (22:53 ক্যান্ডেলে উইন)
+            # শুধুমাত্র নিশ্চিত ট্রেড গণনা
+            confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+            today_trades = [r for r in confirmed_trades if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+            
+            # বর্তমান ট্রেড যোগ করার আগের স্ট্যাটস
+            wins_before = sum(1 for t in today_trades if t.get('result') == 'Profit')
+            losses_before = sum(1 for t in today_trades if t.get('result') == 'Loss')
+            
+            result_msg = _build_result_caption(
+                clean_asset, formatted_time, wins_before + 1, losses_before,
+                "✅✅✅ 𝗦𝗨𝗥𝗘𝗦𝗛𝗢𝗧 ✅✅✅"
+            )
+
+            await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit', signal_direction=direction.upper(), entry_time=formatted_time)
+            _ready_next_signal_now()
+
+            trade_results[-1]['result'] = 'Profit'
+            trade_results[-1]['profit'] = 10.0  # ফিক্সড ভ্যালু
+            trade_results[-1]['martingale_step'] = 0
+            save_trade_results() # **ফলাফল নিশ্চিত হওয়ার পর সেভ**
+            return
+
+        # Martingale logic (22:54, 22:55, ইত্যাদি ক্যান্ডেল চেক)
+        if MARTINGALE_STEPS > 0:
+            for martingale_step in range(1, MARTINGALE_STEPS + 1):
+                # পরবর্তী ক্যান্ডেলের জন্য অপেক্ষা
+                await asyncio.sleep(60)
+
+                mg_candle = None
+                waited = 0
+                # এই মার্টিংগেল স্টেপের ক্যান্ডেলের শুরু: entry_ts + 60 * martingale_step
+                # কারণ প্রথম রেজাল্টের জন্য আমরা entry_ts (22:53) এর ক্যান্ডেল চেক করেছি
+                # দ্বিতীয় মার্টিংগেলের জন্য entry_ts + 60 (22:54)
+                # তৃতীয়টির জন্য entry_ts + 120 (22:55), ইত্যাদি
+                target_ts = entry_ts + 60 * martingale_step
+                while waited <= 70:
+                    new2 = await asyncio.wait_for(get_candles(client, pair, TIMEFRAME), timeout=15)
+                    if new2 and len(new2) >= 1:
+                        # আমরা এমন একটি ক্যান্ডেল খুঁজছি যার টাইমস্ট্যাম্প target_ts এর কাছাকাছি
+                        _mg_candidates = []
+                        for c2 in new2:
+                            ts3 = c2.get('timestamp', 0)
+                            if ts3:
+                                if target_ts - 5 <= ts3 <= target_ts + 65:
+                                    _mg_candidates.append((abs(ts3 - target_ts), c2))
+                                elif target_ts + 55 <= ts3 <= target_ts + 125:
+                                    _mg_candidates.append((abs(ts3 - (target_ts + 60)), c2))
+                        if _mg_candidates:
+                            _mg_candidates.sort(key=lambda x: x[0])
+                            mg_candle = _mg_candidates[0][1]
+                        if mg_candle:
+                            break
+                    await asyncio.sleep(2)
+                    waited += 2
+
+                if mg_candle is None:
+                    # Candle data unavailable — treat as LOSS and notify
+                    print(rainbow_text(f"⚠️ Martingale step {martingale_step}: candle not found, treating as LOSS"))
+                    _fb_confirmed = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+                    _fb_today = [r for r in _fb_confirmed if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+                    _fb_w = sum(1 for t in _fb_today if t.get('result') == 'Profit')
+                    _fb_l = sum(1 for t in _fb_today if t.get('result') == 'Loss')
+                    _fb_chart = await get_candles_for_chart(client, pair, TIMEFRAME) if SEND_PHOTO_WITH_SIGNAL else None
+                    _fb_msg = _build_result_caption(
+                        clean_asset, formatted_time, _fb_w, _fb_l + 1,
+                        "✖️✖️✖️ 𝗟𝗢𝗦𝗦 ✖️✖️✖️",
+                        show_direction=True,
+                        direction_icon=("🟢" if direction == "call" else "🔴"),
+                        direction_label=("CALL" if direction == "call" else "PUT")
+                    )
+                    await send_telegram_photo_or_chart(_fb_msg, pair, _fb_chart, result='Loss', signal_direction=direction.upper(), entry_time=formatted_time)
+                    trade_results[-1]['result'] = 'Loss'
+                    trade_results[-1]['profit'] = -7.0
+                    trade_results[-1]['martingale_step'] = martingale_step
+                    save_trade_results()
+                    break
+
+                mg_open = float(mg_candle.get('open', result_close))
+                mg_close = float(mg_candle.get('close', result_close))
+                mg_win = (direction == 'call' and mg_close > mg_open) or (direction == 'put' and mg_close < mg_open)
+                mg_equal = abs(mg_close - mg_open) < 0.00001
+
+                # শুধুমাত্র নিশ্চিত ট্রেড গণনা
+                confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+                today_trades = [r for r in confirmed_trades if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+                
+                wins_before = sum(1 for t in today_trades if t.get('result') == 'Profit')
+                losses_before = sum(1 for t in today_trades if t.get('result') == 'Loss')
+
+                # --- চার্ট ডেটা আপডেট ---
+                if SEND_PHOTO_WITH_SIGNAL:
+                    chart_candles = await get_candles_for_chart(client, pair, TIMEFRAME)
+                else:
+                    chart_candles = None
+                # --- চার্ট ডেটা আপডেট ---
+
+                if mg_equal:
+                    trade_results[-1]['result'] = 'Break-even'
+                    trade_results[-1]['profit'] = 0.0
+                    trade_results[-1]['martingale_step'] = martingale_step
+                    # **এখন সেভ করি কারণ রেজাল্ট নিশ্চিত**
+                    save_trade_results()
+                    
+                    # ব্রেক-ইভেন রেজাল্ট মেসেজ
+                    mtg_symbol = f"𝙼𝚃𝙶{martingale_step}" if martingale_step <= 3 else f"𝙼𝚃𝙶{martingale_step}"
+                    result_msg = _build_result_caption(
+                        clean_asset, formatted_time, wins_before, losses_before,
+                        f"⚖️⚖️⚖️ {mtg_symbol} 𝗕𝗥𝗘𝗔𝗞-𝗘𝗩𝗘𝗡 ⚖️⚖️⚖️"
+                    )
+
+                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Break-even', signal_direction=direction.upper(), entry_time=formatted_time)
+                    
+                    print(rainbow_text(f"𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎 𝚝𝚛𝚊𝚍𝚎 𝚏𝚘𝚛 {clean_asset} 𝚊𝚝 {formatted_time} 𝚎𝚗𝚍𝚎𝚍 𝚒𝚗 𝙱𝚛𝚎𝚊𝚔-𝚎𝚟𝚎𝚗 (𝚂𝚝𝚎𝙥 {martingale_step})."))
+                    break
+                elif mg_win:
+                    # MARTINGALE WIN লজিক (MTG¹, MTG², etc.)
+                    # MTG স্টেপ অনুযায়ী টেক্সট
+                    mtg_symbol = f"𝙼𝚃𝙶{martingale_step}" if martingale_step <= 3 else f"𝙼𝚃𝙶{martingale_step}"
+                    result_msg = _build_result_caption(
+                        clean_asset, formatted_time, wins_before + 1, losses_before,
+                        "✅✅✅ 𝗠𝗧𝗚 𝗪𝗜𝗡 ✅✅✅",
+                        show_direction=True,
+                        direction_icon=("🟢" if direction == "call" else "🔴"),
+                        direction_label=("CALL" if direction == "call" else "PUT")
+                    )
+
+                    await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Profit', signal_direction=direction.upper(), entry_time=formatted_time)
+
+                    trade_results[-1]['result'] = 'Profit'
+                    trade_results[-1]['profit'] = 10.0  # ফিক্সড ভ্যালু
+                    trade_results[-1]['martingale_step'] = martingale_step
+                    save_trade_results() # **ফলাফল নিশ্চিত হওয়ার পর সেভ**
+                    break
+                else:
+                    # Final loss after all martingale steps
+                    if martingale_step == MARTINGALE_STEPS:
+                        # MARTINGALE LOSS লজিক
+                        result_msg = _build_result_caption(
+                            clean_asset, formatted_time, wins_before, losses_before + 1,
+                            "✖️✖️✖️ 𝗟𝗢𝗦𝗦 ✖️✖️✖️",
+                            show_direction=True,
+                            direction_icon=("🟢" if direction == "call" else "🔴"),
+                            direction_label=("CALL" if direction == "call" else "PUT")
+                        )
+
+                        await send_telegram_photo_or_chart(result_msg, pair, chart_candles, result='Loss', signal_direction=direction.upper(), entry_time=formatted_time)
+
+                        trade_results[-1]['result'] = 'Loss'
+                        trade_results[-1]['profit'] = -7.0  # ফিক্সড ভ্যালু
+                        trade_results[-1]['martingale_step'] = martingale_step
+                        save_trade_results() # **ফলাফল নিশ্চিত হওয়ার পর সেভ**
+                        break
+                    else:
+                        # পরবর্তী মার্টিংগেল স্টেপের জন্য চালিয়ে যাও
+                        continue
+
+        # Handle LOSS when MARTINGALE_STEPS=0 and first candle is a loss
+        if not first_win and not first_equal and MARTINGALE_STEPS == 0:
+            confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+            today_trades_0 = [r for r in confirmed_trades if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+            _w0 = sum(1 for t in today_trades_0 if t.get('result') == 'Profit')
+            _l0 = sum(1 for t in today_trades_0 if t.get('result') == 'Loss')
+            _loss0_msg = _build_result_caption(
+                clean_asset, formatted_time, _w0, _l0 + 1,
+                "✖️✖️✖️ 𝗟𝗢𝗦𝗦 ✖️✖️✖️",
+                show_direction=True,
+                direction_icon=("🟢" if direction == "call" else "🔴"),
+                direction_label=("CALL" if direction == "call" else "PUT")
+            )
+            _cc0 = await get_candles_for_chart(client, pair, TIMEFRAME) if SEND_PHOTO_WITH_SIGNAL else None
+            await send_telegram_photo_or_chart(_loss0_msg, pair, _cc0, result='Loss', signal_direction=direction.upper(), entry_time=formatted_time)
+            trade_results[-1]['result'] = 'Loss'
+            trade_results[-1]['profit'] = -7.0
+            trade_results[-1]['martingale_step'] = 0
+            save_trade_results()
+
+        _ready_next_signal_now()
+
+    except Exception as e:
+        import traceback as _tb
+        _full_err = _tb.format_exc()
+        print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚙𝚛𝚘𝚌𝚎𝚜𝚜𝚒𝚗𝚐 : {e}"))
+        print(_full_err)
+        try:
+            send_telegram_message("\u26a0\ufe0f Bot error during result check:\n<code>" + str(e)[:300] + "</code>")
+        except Exception:
+            pass
+        try:
+            global last_signal_time, next_signal_interval
+            last_signal_time = 0
+            next_signal_interval = 0
+        except Exception:
+            pass
+        if trade_results and trade_results[-1].get('timestamp') == server_now and trade_results[-1].get('result') is None:
+            trade_results.pop()
+
+def get_timestamp():
+    return int(time.time())
+
+def extract_ts(item):
+    for k in ("timestamp","time","t","at","date"):
+        if k in item:
+            try:
+                v = item[k]
+                if isinstance(v, str) and v.isdigit():
+                    return int(v)
+                if isinstance(v, (int,float)):
+                    return int(v)
+            except:
+                pass
+    return None
+
+def normalize(resp):
+    if resp is None: return None
+    if isinstance(resp, dict):
+        for key in ("candles","data","result","values"):
+            if key in resp and isinstance(resp[key], (list,tuple)):
+                lst = resp[key]
+                break
+        else: lst = None
+    elif isinstance(resp, (list,tuple)): lst = resp
+    else: lst = None
+    if not lst: return None
+    out = []
+    for item in lst:
+        if not isinstance(item, dict): continue
+        ts = extract_ts(item)
+        if 'open' in item and 'high' in item and 'low' in item and 'close' in item:
+            try:
+                out.append({'open': float(item['open']), 'high': float(item['high']), 'low': float(item['low']), 'close': float(item['close']), 'timestamp': ts})
+                continue
+            except: pass
+        if 'o' in item and 'h' in item and 'l' in item and 'c' in item:
+            try:
+                out.append({'open': float(item['o']), 'high': float(item['h']), 'low': float(item['l']), 'close': float(item['c']), 'timestamp': ts})
+                continue
+            except: pass
+        vals = list(item.values())
+        if len(vals) >= 4:
+            try:
+                out.append({'open': float(vals[0]), 'high': float(vals[1]), 'low': float(vals[2]), 'close': float(vals[3]), 'timestamp': ts})
+                continue
+            except: pass
+    if not out: return None
+    return out
+
+async def try_fetch(client, asset, period):
+    try:
+        end_time = int(time.time())
+        try:
+            r = await asyncio.wait_for(client.get_candles(asset, end_time, 60, period), timeout=10)
+            return r
+        except: pass
+        try:
+            r = await asyncio.wait_for(client.get_candles(asset, period), timeout=10)
+            return r
+        except: pass
+        try:
+            r = await asyncio.wait_for(client.get_candles(asset, end_time, period), timeout=10)
+            return r
+        except: pass
+        try:
+            func = getattr(client, "get_candles", None)
+            if func:
+                r = func(asset, period)
+                if asyncio.iscoroutine(r): r = await asyncio.wait_for(r, timeout=10)
+                return r
+        except: pass
+        try:
+            func2 = getattr(client, "get_realtime_candles", None)
+            if func2:
+                r = func2(asset, period)
+                if asyncio.iscoroutine(r): r = await asyncio.wait_for(r, timeout=10)
+                return r
+        except: pass
+        try:
+            func3 = getattr(client, "get_candle_v2", None)
+            if func3:
+                r = func3(asset, period, 100)
+                if asyncio.iscoroutine(r): r = await asyncio.wait_for(r, timeout=10)
+                return r
+        except: pass
+    except: pass
+    return None
+
+async def get_candles(client, asset, period, attempts=CANDLE_FETCH_ATTEMPTS):
+    for _ in range(attempts):
+        resp = await try_fetch(client, asset, period)
+        norm = normalize(resp)
+        if norm and len(norm) >= 5: return norm
+        await asyncio.sleep(0.25)
+    return None
+
+def ema(values, period):
+    if len(values) < period: return None
+    alpha = 2.0 / (period + 1.0)
+    ema_val = sum(values[-period:]) / period
+    for i in range(-period + 1, 0):
+        ema_val = values[i] * alpha + ema_val * (1 - alpha)
+    return ema_val
+
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50.0
+    gains = []; losses = []
+    for i in range(len(prices)-period, len(prices)-1):
+        change = prices[i+1] - prices[i]
+        if change > 0: gains.append(change); losses.append(0)
+        else: gains.append(0); losses.append(abs(change))
+    if not gains or not losses: return 50.0
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def calculate_bollinger(prices, period=20, std_dev=2):
+    if len(prices) < period: return None, None, None
+    ma = np.mean(prices[-period:])
+    std = np.std(prices[-period:])
+    upper = ma + (std * std_dev)
+    lower = ma - (std * std_dev)
+    return ma, upper, lower
+
+def calculate_support_resistance_levels(prices, lookback=20):
+    """সাপোর্ট এবং রেজিস্ট্যান্স লেভেল ক্যালকুলেট করে"""
+    if len(prices) < lookback:
+        return None, None
+    
+    recent_prices = prices[-lookback:]
+    resistance = max(recent_prices)
+    support = min(recent_prices)
+    
+    return support, resistance
+
+def calculate_moving_averages(candles, periods=[20, 50, 100, 200]):
+    """মুভিং এভারেজ ক্যালকুলেট করে"""
+    closes = [c['close'] for c in candles]
+    ma_values = {}
+    
+    for period in periods:
+        if len(closes) >= period:
+            ma_values[period] = ema(closes, period)
+    
+    return ma_values
+
+# ================= নতুন স্ট্র্যাটেজি অ্যানালাইসিস ফাংশন =================
+
+def analyze_market(candle_data):
+    global CURRENT_STRATEGY, EMA_PERIOD, RSI_PERIOD, MIN_SIGNAL_SCORE, SUPPORT_RESISTANCE_STRATEGY, SUPERTREND_STRATEGY
+    if not candle_data or len(candle_data) < max(EMA_PERIOD, RSI_PERIOD): 
+        return None, 0.0
+    
+    closes = [c['close'] for c in candle_data]
+
+    if CURRENT_STRATEGY == "EMA_RSI":
+        rsi = calculate_rsi(closes, RSI_PERIOD)
+        ema_val = ema(closes, EMA_PERIOD)
+        current_price = closes[-1]
+
+        sig_dir = None
+        score = 0
+
+        if current_price > ema_val and 50 < rsi < 70:
+            sig_dir = "call"; score = 5
+        elif current_price < ema_val and 30 < rsi < 50:
+            sig_dir = "put"; score = 5
+        elif rsi > 80:
+            sig_dir = "put"; score = 4
+        elif rsi < 20:
+            sig_dir = "call"; score = 4
+        
+        # Check if signal meets minimum score
+        if score < MIN_SIGNAL_SCORE: 
+            return None, 0.0
+        
+        # Additional confirmation: check recent trend
+        if len(closes) >= 3:
+            recent_trend = sum(1 for i in range(-3, 0) if closes[i] > closes[i-1])
+            if sig_dir == "call" and recent_trend < 2:
+                score -= 1
+            elif sig_dir == "put" and recent_trend > 1:
+                score -= 1
+        
+        if score >= MIN_SIGNAL_SCORE:
+            return sig_dir, score
+        else:
+            return None, 0.0
+
+    elif CURRENT_STRATEGY == "Trend":
+        if len(closes) < 10: return None, 0.0
+        trend_score = sum(1 if closes[i] > closes[i-1] else -1 for i in range(-5, 0))
+        if trend_score >= 3: return "call", 4
+        elif trend_score <= -3: return "put", 4
+        return None, 0.0
+
+    elif CURRENT_STRATEGY == "Bollinger":
+        if len(closes) < 20: return None, 0.0
+        ma, upper, lower = calculate_bollinger(closes)
+        if ma is None: return None, 0.0
+        
+        current_price = closes[-1]
+        prev_price = closes[-2] if len(closes) >= 2 else current_price
+        
+        if current_price < lower and prev_price >= lower:
+            return "call", 5
+        elif current_price > upper and prev_price <= upper:
+            return "put", 5
+        return None, 0.0
+
+    elif CURRENT_STRATEGY == "Support_Resistance" and SUPPORT_RESISTANCE_STRATEGY:
+        if len(closes) < 20: return None, 0.0
+        support, resistance = calculate_support_resistance_levels(closes)
+        current_price = closes[-1]
+        prev_price = closes[-2] if len(closes) >= 2 else current_price
+        
+        if support and resistance:
+            # Resistance breakout with confirmation
+            if current_price > resistance and prev_price <= resistance:
+                # Check volume or other confirmation
+                return "call", 5
+            # Support breakdown with confirmation
+            elif current_price < support and prev_price >= support:
+                return "put", 5
+            # Resistance rejection with strong bearish candle
+            elif abs(current_price - resistance) / resistance < 0.001 and current_price < prev_price:
+                return "put", 4
+            # Support bounce with strong bullish candle
+            elif abs(current_price - support) / support < 0.001 and current_price > prev_price:
+                return "call", 4
+        
+        return None, 0.0
+
+    elif CURRENT_STRATEGY == "Trend_Reverse":
+        # ট্রেন্ড+রিভার্স স্ট্র্যাটেজি
+        if len(closes) < 30: return None, 0.0
+        
+        # ট্রেন্ড ডিটেকশন
+        ma20 = ema(closes, 20) if len(closes) >= 20 else None
+        ma50 = ema(closes, 50) if len(closes) >= 50 else None
+        current_price = closes[-1]
+        
+        # RSI for overbought/oversold
+        rsi = calculate_rsi(closes, 14)
+        
+        # Support and Resistance levels
+        support, resistance = calculate_support_resistance_levels(closes, lookback=20)
+        
+        sig_dir = None
+        score = 0
+        logic = ""
+        
+        if ma20 and ma50:
+            # Uptrend detected
+            if current_price > ma20 and ma20 > ma50:
+                logic = "UP_TREND"
+                # Check for overbought reversal
+                if rsi > 70 and resistance and abs(current_price - resistance) / resistance < 0.005:
+                    sig_dir = "put"  # Potential reversal from resistance
+                    score = 5
+                    logic = "REVERSAL_AT_RESISTANCE"
+                else:
+                    # Trend continuation
+                    sig_dir = "call"
+                    score = 4
+                    logic = "TREND_CONTINUATION"
+            
+            # Downtrend detected
+            elif current_price < ma20 and ma20 < ma50:
+                logic = "DOWN_TREND"
+                # Check for oversold reversal
+                if rsi < 30 and support and abs(current_price - support) / support < 0.005:
+                    sig_dir = "call"  # Potential reversal from support
+                    score = 5
+                    logic = "REVERSAL_AT_SUPPORT"
+                else:
+                    # Trend continuation
+                    sig_dir = "put"
+                    score = 4
+                    logic = "TREND_CONTINUATION"
+            
+            # Sideways market
+            else:
+                logic = "SIDEWAYS"
+                # Range trading strategy
+                if resistance and support:
+                    range_mid = (resistance + support) / 2
+                    if current_price > range_mid and rsi < 60:
+                        sig_dir = "call"
+                        score = 3
+                        logic = "RANGE_BOUNCE_FROM_MID"
+                    elif current_price < range_mid and rsi > 40:
+                        sig_dir = "put"
+                        score = 3
+                        logic = "RANGE_DROP_FROM_MID"
+        
+        # Additional confirmation with volume if available
+        if sig_dir and len(candle_data) > 1:
+            last_volume = candle_data[-1].get('volume', 0)
+            prev_volume = candle_data[-2].get('volume', 0) if len(candle_data) > 1 else 0
+            
+            # Volume confirmation
+            if last_volume > prev_volume * 1.2:
+                score += 1  # Increase score with volume confirmation
+        
+        if sig_dir and score >= MIN_SIGNAL_SCORE:
+            return sig_dir, score
+        else:
+            return None, 0.0
+
+    elif CURRENT_STRATEGY == "Price_Action":
+        """প্রাইস অ্যাকশন স্ট্র্যাটেজি"""
+        if len(candle_data) < 5: return None, 0.0
+        
+        patterns = detect_price_action_patterns(candle_data)
+        current_price = closes[-1]
+        prev_price = closes[-2] if len(closes) >= 2 else current_price
+        
+        sig_dir = None
+        score = 0
+        
+        # Check for recent patterns
+        recent_patterns = [p for p in patterns if p['candle_index'] >= len(candle_data) - 3]
+        
+        for pattern in recent_patterns:
+            if pattern['type'] in ['BULLISH_ENGULFING', 'HAMMER']:
+                sig_dir = "call"
+                score = 5
+                break
+            elif pattern['type'] in ['BEARISH_ENGULFING', 'SHOOTING_STAR']:
+                sig_dir = "put"
+                score = 5
+                break
+        
+        # If no pattern found, use simple price action
+        if not sig_dir:
+            # Bullish if higher high and higher low
+            if len(closes) >= 3:
+                if closes[-1] > closes[-2] > closes[-3]:
+                    sig_dir = "call"
+                    score = 4
+                elif closes[-1] < closes[-2] < closes[-3]:
+                    sig_dir = "put"
+                    score = 4
+        
+        if sig_dir and score >= MIN_SIGNAL_SCORE:
+            return sig_dir, score
+        else:
+            return None, 0.0
+
+    elif CURRENT_STRATEGY == "Supertrend" and SUPERTREND_STRATEGY:
+        """সুপারট্রেন্ড স্ট্র্যাটেজি"""
+        if len(candle_data) < 20: return None, 0.0
+        
+        supertrend_values, trend_values = calculate_supertrend(candle_data, period=10, multiplier=3)
+        
+        if supertrend_values and trend_values and supertrend_values[-1] is not None:
+            current_price = closes[-1]
+            current_supertrend = supertrend_values[-1]
+            current_trend = trend_values[-1]
+            
+            sig_dir = None
+            score = 0
+            
+            # Bullish signal when price crosses above supertrend in uptrend
+            if current_trend == 1 and current_price > current_supertrend:
+                sig_dir = "call"
+                score = 5
+            # Bearish signal when price crosses below supertrend in downtrend
+            elif current_trend == -1 and current_price < current_supertrend:
+                sig_dir = "put"
+                score = 5
+            # Trend continuation signals
+            elif current_trend == 1 and current_price > current_supertrend * 1.001:
+                sig_dir = "call"
+                score = 4
+            elif current_trend == -1 and current_price < current_supertrend * 0.999:
+                sig_dir = "put"
+                score = 4
+            
+            if sig_dir and score >= MIN_SIGNAL_SCORE:
+                return sig_dir, score
+        
+        return None, 0.0
+
+    elif CURRENT_STRATEGY == "FVG_Strategy":
+        """FVG স্ট্র্যাটেজি"""
+        if len(candle_data) < 10: return None, 0.0
+        
+        fvg_gaps = detect_fvg_gaps(candle_data)
+        current_price = closes[-1]
+        
+        sig_dir = None
+        score = 0
+        
+        # Check for recent FVG gaps
+        recent_fvg = [g for g in fvg_gaps if g['candle_index'] >= len(candle_data) - 5]
+        
+        for fvg in recent_fvg:
+            # Bullish FVG: Price above FVG zone suggests bullish continuation
+            if fvg['type'] == 'BULLISH_FVG' and current_price > fvg['end_price']:
+                sig_dir = "call"
+                score = 5
+                break
+            # Bearish FVG: Price below FVG zone suggests bearish continuation
+            elif fvg['type'] == 'BEARISH_FVG' and current_price < fvg['end_price']:
+                sig_dir = "put"
+                score = 5
+                break
+        
+        if sig_dir and score >= MIN_SIGNAL_SCORE:
+            return sig_dir, score
+        else:
+            return None, 0.0
+
+    return None, 0.0
+
+async def analyze_pair(client, pair):
+    data = await get_candles(client, pair, TIMEFRAME)
+    if not data or len(data) < 20: 
+        return None
+    
+    # Additional validation: check if we have recent data
+    if len(data) < 5:
+        return None
+    
+    # Check if data is valid (no extreme spikes)
+    closes = [c['close'] for c in data]
+    price_range = max(closes) - min(closes)
+    avg_price = sum(closes) / len(closes)
+    
+    # Filter out pairs with too much volatility or abnormal prices
+    if price_range / avg_price > 0.1:  # More than 10% range in recent candles
+        return None
+    
+    direction, score = analyze_market(data)
+    if direction and score >= MIN_SIGNAL_SCORE: 
+        return direction, score, data
+    return None
+
+# ================= get_profitable_pairs ফাংশন (আপডেট) =================
+
+async def get_profitable_pairs(client, min_profit=70):
+    global ANALYZE_ALL_PAIRS, CUSTOM_PAIRS_MODE, CUSTOM_PAIRS_LIST
+
+    if CUSTOM_PAIRS_MODE and CUSTOM_PAIRS_LIST:
+        print(rainbow_text(f"✅ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛𝚜 𝙼𝚘𝚍𝚎 𝙾𝙽. 𝙰𝚗𝚊𝚕𝚢S {len(CUSTOM_PAIRS_LIST)} 𝚌𝚞𝚜𝚝𝚖 𝙿𝚊𝚒𝚛𝚜."))
+        return CUSTOM_PAIRS_LIST
+
+    # যদি Custom Pairs Mode OFF থাকে, তবে স্বাভাবিক লজিক ব্যবহার করা হবে
+    try:
+        assets = None
+        if hasattr(client, "get_all_assets"):
+            r = client.get_all_assets()
+            if asyncio.iscoroutine(r): assets = await r
+            else: assets = r
+        else: assets = None
+    except Exception as e:
+        print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚐𝚎𝚝𝚝𝚒𝚗𝚐 𝚊𝚜𝚎𝚝𝚜 𝚏𝚛𝚘𝚖 𝙰𝙿𝙸: {e}"))
+        assets = None
+
+    if not assets:
+        print(rainbow_text("𝚐𝚎𝚍_𝚊𝚕𝚕_𝚊𝚓𝚜𝚎𝚍 𝚛𝚎𝚝𝚞𝚗𝚎𝚍  𝚝𝚘𝚝𝚎. 𝚄𝚜𝚒𝚗𝚐 𝚏𝚒𝚕𝚝𝚎𝚍 𝚍𝚎𝚏𝚊𝚞𝚕𝚝 𝙿𝚊𝚛𝚛𝚜."))
+        if ANALYZE_ALL_PAIRS: return list(PAIR_NAMES.keys())
+        else: return [p for p in list(PAIR_NAMES.keys()) if p.lower() not in OTC_PAIRS_TO_EXCLUDE]
+
+    def normalize_profit(v):
+        try: v_f = float(v)
+        except Exception: return 0.0
+        if v_f >= 300: return v_f - 300
+        if 0 < v_f <= 1: return v_f * 100.0
+        return v_f
+
+    pairs = []
+
+    def should_exclude(pair_name):
+        if ANALYZE_ALL_PAIRS: return False
+        pair_check_name = pair_name.lower().replace('-otc', '_otc')
+        if pair_check_name in OTC_PAIRS_TO_EXCLUDE: return True
+        if pair_name.upper().replace('_OTC', '-OTC') in OTC_PAIRS_TO_EXCLUDE: return True
+        return False
+
+    if isinstance(assets, dict):
+        for name, raw in assets.items():
+            if should_exclude(name): continue
+            payout = 0.0
+            if isinstance(raw, (int, float, str)): payout = normalize_profit(raw)
+            elif isinstance(raw, dict):
+                if 'payout' in raw: payout = normalize_profit(raw.get('payout'))
+                elif 'profit' in raw: payout = normalize_profit(raw.get('profit'))
+                elif 'yield' in raw: payout = normalize_profit(raw.get('yield'))
+                else:
+                    found = None
+                    for val in raw.values():
+                        try:
+                            found = float(val)
+                            break
+                        except: continue
+                    payout = normalize_profit(found if found is not None else 0.0)
+            else: payout = 0.0
+
+            if payout >= min_profit: pairs.append(name)
+    elif isinstance(assets, (list, tuple)):
+        for a in assets:
+            name = None; payout = 0.0
+            if isinstance(a, str): name = a
+            elif isinstance(a, dict):
+                name = a.get('name') or a.get('displayName') or a.get('title') or a.get('asset_name') or None
+                for key in ('payout','profit','yield','return'):
+                    if key in a:
+                        payout = normalize_profit(a.get(key))
+                        break
+
+            if name:
+                if should_exclude(name): continue
+                if isinstance(a, str) or payout >= min_profit: pairs.append(name)
+
+    pairs = list(dict.fromkeys(pairs))
+
+    if not pairs:
+        print(rainbow_text("𝙽𝚘 𝚙𝚊𝚒𝚛𝚜 𝚏𝚘𝚞𝚗𝚍 𝚠𝚒𝚝𝚑 𝚖𝚒𝚗_𝚙𝚛𝚘𝚒𝚝, 𝚍𝚎𝚏𝚊𝚞𝚕𝚝 𝙿𝚊𝚒𝚛𝚜."))
+        if ANALYZE_ALL_PAIRS: pairs = list(PAIR_NAMES.keys())
+        else: pairs = [p for p in list(PAIR_NAMES.keys()) if p.lower() not in OTC_PAIRS_TO_EXCLUDE]
+
+    filter_status = "𝙰𝚕𝚕 𝚙চ�𝚒𝚛𝚜 𝚒𝚗𝚌𝚕𝚞𝚍" if ANALYZE_ALL_PAIRS else f"𝙴𝚡𝚌𝚕𝚞𝚍𝚒𝚗𝚐 {len(OTC_PAIRS_TO_EXCLUDE)} 𝙾𝚃𝙲 𝚙𝚊𝚒𝚛𝚜"
+    print(rainbow_text(f"✅ 𝙻𝚘𝚊𝚍𝚎𝚍 {len(pairs)} 𝚙𝚊𝚒𝚛𝚜 𝚏𝚛𝚘𝚖 𝙰𝙿𝙸 (𝚖𝚒𝚛_𝚙𝚛𝚘𝚒𝚝={min_profit}) - {filter_status}."))
+    return pairs
+
+# ================= send_partial_results ফাংশন (নতুন স্টাইল) =================
+
+def send_partial_results():
+    """Send partial results in styled format matching user design"""
+    global last_partial_results_time
+
+    last_partial_results_time = int(time.time())
+
+    bd_time    = datetime.now(pytz.timezone('Asia/Dhaka'))
+    # Format date as 𝟸𝟶𝟸𝟼.𝟶𝟻.𝟶𝟼 using mathematical bold digits
+    _digits = {"0":"𝟶","1":"𝟷","2":"𝟸","3":"𝟹","4":"𝟺","5":"𝟻","6":"𝟼","7":"𝟽","8":"𝟾","9":"𝟿"}
+    def _bold_num(s):
+        return "".join(_digits.get(c, c) for c in s)
+    raw_date   = bd_time.strftime("%Y.%m.%d")
+    bold_date  = _bold_num(raw_date)
+
+    confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss', 'Break-even']]
+    today_trades     = [r for r in confirmed_trades if r.get('date') == bd_time.date().isoformat()]
+
+    wins   = sum(1 for t in today_trades if t.get('result') == 'Profit')
+    losses = sum(1 for t in today_trades if t.get('result') == 'Loss')
+    total  = wins + losses
+    acc_val = f"{wins/total*100:.0f}%" if total > 0 else "0%"
+
+    tf_str = f"M{TIMEFRAME//60}" if TIMEFRAME >= 60 else f"S{TIMEFRAME}"
+
+    DIVIDER   = "━━━━━━━━━・━━━━━━━━━"
+    HDR_TOP   = "=========== Result'S==========="
+    HDR_BOT   = "==============================="
+
+    msg  = f"<b>{HDR_TOP}\n\n"
+    msg += f"{DIVIDER}\n"
+    msg += f"          📆 - {bold_date}          \n"
+    msg += f"{DIVIDER}\n\n"
+
+    if not today_trades:
+        msg += "     ——— NO SIGNALS YET ———\n\n"
+    else:
+        for trade in today_trades[-25:]:
+            t_time    = trade.get('signal_time', '00:00')
+            pair_raw  = trade.get('pair_display', trade.get('pair', ''))
+            pair_disp = pair_raw.replace('_otc', '-OTC').replace('_OTC', '-OTC').upper()
+            direction = 'PUT' if trade.get('direction', 'call') == 'put' else 'CALL'
+            r         = trade.get('result')
+            mtg       = trade.get('martingale_step', 0)
+            if r == 'Profit':
+                icon = ("✅¹" if mtg == 1 else "✅²" if mtg == 2 else "✅³" if mtg == 3 else f"✅{mtg}" if mtg > 0 else "✅")
+            elif r == 'Loss':
+                icon = "❌️"
+            else:
+                icon = "⚖️"
+            dir_pad = direction.ljust(4)
+            # currency pair in monospace bold; rest of line in monospace
+            msg += f"</b><b><code>{tf_str} {pair_disp} {t_time} {dir_pad} {icon}</code></b><b>\n"
+
+    msg += f"\n{DIVIDER}\n\n"
+    msg += f"🏆 <b>Wins</b>     : {wins}\n"
+    msg += f"❌ <b>Losses</b>  : {losses}\n"
+    msg += f"📈 <b>Accuracy</b>: {acc_val}\n\n"
+    msg += f"{DIVIDER}\n\n"
+    msg += f"🤖 {CHART_HEADER_TEXT}\n"
+    msg += f"💌 {SIGNAL_USERNAME}\n\n"
+    msg += f"{HDR_BOT}</b>"
+
+    send_telegram_message(msg)
+
+# ================= send_signal ফাংশন =================
+
+async def send_signal(client):
+    global last_signal_time, signal_count, bot_running, current_signal_task, last_partial_results_time, next_signal_interval, SIGNAL_INTERVAL_MIN, SIGNAL_INTERVAL_MAX, continuous_analysis
+
+    now = int(time.time())
+
+    # Check if it's time for the next signal
+    if now - last_signal_time < next_signal_interval: 
+        return
+
+    if not bot_running: 
+        return
+
+    if current_signal_task:
+        if current_signal_task.done():
+            try:
+                current_signal_task.result()
+            except Exception as e:
+                print(rainbow_text(f"⚠️ 𝙿𝚛𝚎𝚟𝚒𝚘𝚞𝚜 𝚜𝚒𝚐𝚗𝚊𝚕 𝚝𝚊𝚜𝚔 𝚎𝚛𝚛𝚘𝚛: {e}"))
+            current_signal_task = None
+        else:
+            if len(signal_queue) < 5:
+                signal_queue.append(now)
+            return
+
+    if signal_queue:
+        signal_time = signal_queue.popleft()
+        if int(time.time()) - signal_time < 600: 
+            last_signal_time = signal_time
+        else:
+            if signal_queue: 
+                signal_queue.popleft()
+            return
+
+    last_signal_time = now
+    next_signal_interval = get_next_signal_interval()
+
+    # ── Analyze pairs sequentially in the SAME event loop ──
+    pairs = await get_profitable_pairs(client, min_profit=70)
+    if not pairs:
+        print(rainbow_text("𝙽𝚘 𝚙𝚛𝚘𝚏𝚒𝚝𝚊𝚋𝚕𝚎 𝚙𝚊𝚒𝚛𝚜 𝚏𝚘𝚞𝚗𝚍. 𝚂𝚔𝚒𝚙𝚙𝚒𝚗𝚐 𝚝𝚑𝚒𝚜 𝚌𝚢𝚌𝚕𝚎."))
+        await asyncio.sleep(10)
+        return
+
+    best_pair = None
+    best_dir = None
+    best_score = -1e9
+    best_data = None
+    viable_pairs = []
+
+    for pair in pairs[:12]:
+        if not bot_running:
+            break
+        try:
+            result = await asyncio.wait_for(analyze_pair(client, pair), timeout=15)
+            if result and len(result) == 3:
+                direction, score, data = result
+                if direction and score > 0:
+                    viable_pairs.append((pair, direction, score, data))
+                    if score > best_score:
+                        best_pair, best_dir, best_score, best_data = pair, direction, score, data
+        except Exception as e:
+            print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚙𝚛𝚘𝚌𝚎𝚜𝚜𝚒𝚗𝚐 𝚙𝚊𝚒𝚛 {pair}: {e}"))
+            continue
+
+    if not viable_pairs:
+        print(rainbow_text("⚠️ 𝙽𝚘 𝚟𝚊𝚕𝚒𝚍 𝚜𝚒𝚐𝚗𝚊𝚕𝚜 𝚏𝚘𝚞𝚗𝚍. 𝚂𝚔𝚒𝚙𝚙𝚒𝚗𝚐 𝚝𝚑𝚒𝚜 𝚌𝚢𝚌𝚕𝚎."))
+        await asyncio.sleep(10)
+        return
+
+    if not best_pair and viable_pairs:
+        viable_pairs.sort(key=lambda x: x[2], reverse=True)
+        best_pair, best_dir, best_score, best_data = viable_pairs[0]
+        print(rainbow_text(f"⚠️ 𝚄𝚜𝚒𝚗𝚐 𝚋𝚎𝚜𝚝 𝚊𝚟𝚊𝚒𝚕𝚊𝚋𝚕𝚎 𝚜𝚒𝚐𝚗𝚊𝚕 (𝚜𝚌𝚘𝚛𝚎: {best_score})"))
+
+    if best_pair and best_dir and best_data:
+        current_signal_task = asyncio.create_task(
+            asyncio.wait_for(process_signal(client, best_pair, best_dir, best_data), timeout=420)
+        )
+        signal_count += 1
+        print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 #{signal_count} 𝚜𝚎𝚗𝚝 𝚏𝚘𝚛 {best_pair} ({best_dir}) 𝚠𝚒𝚝𝚑 𝚜𝚌𝚘𝚛𝚎: {best_score}"))
+    else:
+        print(rainbow_text("⚠️ 𝙽𝚘 𝚜𝚒𝚐𝚗𝚊𝚕 𝚖𝚎𝚎𝚝𝚒𝚗𝚐 𝚖𝚒𝚗𝚒𝚖𝚞𝚖 𝚜𝚌𝚘𝚛𝚎 𝚛𝚎𝚚𝚞𝚒𝚛𝚎𝚖𝚎𝚗𝚝𝚜."))
+        await asyncio.sleep(10)
+
+# ================= ট্রেডিং বট ফাংশন =================
+
+async def trading_bot():
+    global last_signal_time, start_time, next_signal_interval, BOT_ALERT_ON
+    email = "qtrader874@gmail.com"
+    password = "@quotextrader123"
+
+    start_time = int(time.time())
+    next_signal_interval = get_next_signal_interval()
+
+    client = Quotex(email=email, password=password, lang="en")
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            success, msg = await client.connect()
+            if success: break
+            else:
+                print(rainbow_text(f"𝙲𝚘𝚗𝚗𝚎𝚌𝚝𝚒𝚘𝚗 𝚊𝚝𝚝𝚎𝚖𝚙𝚝 {attempt+1} 𝚏𝚊𝚒𝚕𝚎𝚍: {msg}"))
+                if attempt < max_retries - 1: await asyncio.sleep(5)
+        except Exception as e:
+            print(rainbow_text(f"𝙲𝚘𝚗𝚗𝚎𝚌𝚝𝚒𝚘𝚗 𝚎𝚛𝚛𝚘𝚛 𝚘𝚗 𝚊𝚝𝚝𝚎𝚖𝚙𝚝 {attempt+1}: {e}"))
+            if attempt < max_retries - 1: await asyncio.sleep(5)
+    else:
+        # Enhanced Telegram message for connection failure
+        if BOT_ALERT_ON:
+            _t_fail = datetime.now(pytz.timezone('Asia/Dhaka')).strftime('%H:%M | %d/%m/%Y')
+            connection_failed_msg = (
+                f"<b>╔═╺───────◇───────╺═╗\n🔴 CONNECTION FAILED\n╚═╺───────◆───────╺═╝</b>\n"
+                f"\u26a0\ufe0f Could not connect to Quotex\n"
+                f"\U0001f550 {_t_fail}\n"
+                f"\U0001f48c {SIGNAL_USERNAME}"
+            )
+            send_telegram_message(connection_failed_msg)
+        return
+
+    pass  # Bot started silently
+
+    while bot_running:
+        try:
+            # Do not touch the Quotex client while a signal result is being
+            # processed — concurrent WebSocket access causes deadlock.
+            if current_signal_task and not current_signal_task.done():
+                await asyncio.sleep(1)
+                continue
+            if not await asyncio.wait_for(client.check_connect(), timeout=10):
+                print(rainbow_text("𝙲𝚘𝚗𝚗𝚎𝚌𝚝𝚒𝚘𝚗 𝚕𝚘𝚜𝚝, 𝚊𝚝𝚝𝚎𝚖𝚙𝚝𝚒𝚗𝚐 𝚝𝚘 𝚛𝚎𝚌𝚘𝚗𝚗𝚎𝚌𝚝..."))
+                success, msg = await client.connect()
+                if not success:
+                    print(rainbow_text(f"𝚁𝚎𝚌𝚘𝚗𝚗𝚎𝚌𝚝𝚒𝚘𝚗 𝚏𝚊𝚒𝚕𝚎𝚍: {msg}"))
+                    await asyncio.sleep(10)
+                    continue
+
+            await send_signal(client)
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚒𝚗 𝚝𝚛𝚊𝚍𝚒𝚗𝚐 𝚕𝚘𝚘𝚙: {e}"))
+            await asyncio.sleep(2)
+def _thread_target():
+    import asyncio
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(trading_bot())
+    except Exception as e:
+        print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚒𝚗 𝚝𝚑𝚛𝚎𝚊𝚍: {e}"))
+    finally:
+        try:
+            loop.close()
+        except: pass
+
+def ensure_telegram_auth():
+      """Telegram login check and auth in main thread before starting bot"""
+      import asyncio as _asyncio
+      import os as _os
+      
+      # Use absolute session path to avoid database lock issues
+      _session_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'premium_session')
+      
+      async def _do_auth():
+          from telethon import TelegramClient as _TGClient
+          _client = _TGClient(_session_path, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+          try:
+              await _client.connect()
+              if await _client.is_user_authorized():
+                  print(rainbow_text("✅ Telegram already logged in! Auto-skipping login."))
+                  return
+              # Not authorized
+              print("\n" + "="*52)
+              print(rainbow_text("📱 Telegram Login Required"))
+              print("="*52)
+              print(rainbow_text("𝟷. 📩 Enter Telegram login code"))
+              print(rainbow_text("𝟸. ⏭️  Skip login"))
+              print("="*52)
+              c = input(rainbow_text("Choose option: ")).strip()
+              if c == "1":
+                  try:
+                      await _client.send_code_request(TELEGRAM_PHONE_NUMBER)
+                      code = input(rainbow_text("📩 Enter the Telegram login code: ")).strip()
+                      await _client.sign_in(TELEGRAM_PHONE_NUMBER, code)
+                      print(rainbow_text("✅ Telegram login successful!"))
+                  except Exception as e:
+                      print(rainbow_text(f"❌ Login failed: {e}"))
+              else:
+                  print(rainbow_text("⏭️ Skipping Telegram login."))
+          except Exception as e:
+              err_str = str(e).lower()
+              # If database is locked but session file exists, assume already logged in
+              if ("database is locked" in err_str or "blocked" in err_str) and _os.path.exists(_session_path + '.session'):
+                  print(rainbow_text("✅ Session file found - skipping Telegram login."))
+              else:
+                  print(rainbow_text(f"❌ Auth error: {e}"))
+          finally:
+              try:
+                  await _client.disconnect()
+              except:
+                  pass
+              import time as _time
+              _time.sleep(0.5)  # Give SQLite time to release the lock
+      
+      _asyncio.run(_do_auth())
+
+def start_bot():
+    global bot_running, last_partial_results_time, BOT_ALERT_ON, last_signal_time
+    if bot_running:
+        if BOT_ALERT_ON:
+            send_telegram_message("ℹ️ 𝙱𝚘𝚝 𝚒𝚜 𝚊𝚕𝚛𝚎𝚊𝚍𝚢 𝚛𝚞𝚗𝚗𝚒𝚗𝚐")
+        return
+    bot_running = True
+    last_signal_time = 0  # Reset so first signal fires immediately
+    last_partial_results_time = int(time.time())
+    t = threading.Thread(target=_thread_target, daemon=True)
+    t.start()
+    # টেলিগ্রাম ক্লায়েন্ট শুরু করুন
+    telegram_thread = threading.Thread(target=start_telegram_client, daemon=True)
+    telegram_thread.start()
+    print(rainbow_text("🤖 𝙱𝚘𝚝 𝚜𝚝𝚊𝚛𝚝𝚎𝚍 𝚜𝚞𝚌𝚌𝚎𝚜𝚜𝚏𝚞𝚕𝚕𝚢!"))
+
+def stop_bot():
+    global bot_running, BOT_ALERT_ON
+    if not bot_running: return
+    bot_running = False
+    
+    pass  # Bot stopped silently
+    print(rainbow_text("⏹️ 𝙱𝚘𝚟 𝚜𝚝𝚘𝚙𝚙𝚎𝚍"))
+
+# ================= TELEGRAM BOT COMMAND INTERFACE =================
+# Admin-only: only ADMIN_TELEGRAM_USER_ID can send commands.
+# All other users are silently ignored (no reply at all).
+# Works fully without a terminal — ideal for server hosting/deployment.
+
+_tg_app = None
+_tg_app_thread = None
+_pending_input = {}  # user_id -> setting_name waiting for text reply
+
+def _is_admin(update) -> bool:
+    """Return True only if the sender is the configured admin."""
+    try:
+        user = update.effective_user
+        if user is None:
+            return False
+        return int(user.id) == int(ADMIN_TELEGRAM_USER_ID)
+    except Exception:
+        return False
+
+def _tg_main_keyboard():
+    """Build main menu inline keyboard"""
+    status = "🟢 RUNNING" if bot_running else "🔴 STOPPED"
+    rows = []
+    if not bot_running:
+        rows.append([InlineKeyboardButton("▶️ Start Bot", callback_data="cmd_start_bot")])
+    else:
+        rows.append([InlineKeyboardButton("⏹️ Stop Bot", callback_data="cmd_stop_bot")])
+    rows.append([
+        InlineKeyboardButton("📊 Manual Result", callback_data="cmd_manual_menu"),
+        InlineKeyboardButton("📤 Partial Results", callback_data="cmd_partial"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⚙️ Settings", callback_data="cmd_settings"),
+        InlineKeyboardButton("📈 Status", callback_data="cmd_status"),
+    ])
+    rows.append([InlineKeyboardButton("🔄 Refresh Menu", callback_data="cmd_refresh")])
+    return InlineKeyboardMarkup(rows)
+
+def _tg_settings_keyboard():
+    """Page 1 of 4 — All Toggle Switches"""
+    def s(v): return "✅" if v else "❌"
+    rows = [
+        [InlineKeyboardButton(f"📷 Chart Photo: {s(SEND_PHOTO_WITH_SIGNAL)}", callback_data="tog_SEND_PHOTO_WITH_SIGNAL")],
+        [InlineKeyboardButton(f"🌐 All Pairs: {s(ANALYZE_ALL_PAIRS)}", callback_data="tog_ANALYZE_ALL_PAIRS"),
+         InlineKeyboardButton(f"🎯 Custom Pairs: {s(CUSTOM_PAIRS_MODE)}", callback_data="tog_CUSTOM_PAIRS_MODE")],
+        [InlineKeyboardButton(f"🔔 Bot Alert: {s(BOT_ALERT_ON)}", callback_data="tog_BOT_ALERT_ON"),
+         InlineKeyboardButton(f"📊 Adv Analysis: {s(ADVANCED_ANALYSIS)}", callback_data="tog_ADVANCED_ANALYSIS")],
+        [InlineKeyboardButton(f"📐 S/R Lines: {s(SUPPORT_RESISTANCE_LINES)}", callback_data="tog_SUPPORT_RESISTANCE_LINES"),
+         InlineKeyboardButton(f"📉 MA Lines: {s(MOVING_AVERAGE_LINES)}", callback_data="tog_MOVING_AVERAGE_LINES")],
+        [InlineKeyboardButton(f"🔲 Grid: {s(SHOW_GRID_LINES)}", callback_data="tog_SHOW_GRID_LINES"),
+         InlineKeyboardButton(f"💲 Price Scale: {s(SHOW_PRICE_SCALE)}", callback_data="tog_SHOW_PRICE_SCALE")],
+        [InlineKeyboardButton(f"🌀 Parab SAR: {s(PARABOLIC_SAR_LINES)}", callback_data="tog_PARABOLIC_SAR_LINES"),
+         InlineKeyboardButton(f"🎯 FVG Gap: {s(FVG_GAP_DRAW)}", callback_data="tog_FVG_GAP_DRAW")],
+        [InlineKeyboardButton(f"📈 EMA Chart: {s(EMA_LINE_CHART)}", callback_data="tog_EMA_LINE_CHART"),
+         InlineKeyboardButton(f"🚀 Supertrend: {s(SUPERTREND_CHART)}", callback_data="tog_SUPERTREND_CHART")],
+        [InlineKeyboardButton(f"💧 Watermark: {s(WATERMARK_ON)}", callback_data="tog_WATERMARK_ON"),
+         InlineKeyboardButton(f"📐 SNR Lines: {s(SNR_LINES)}", callback_data="tog_SNR_LINES")],
+        [InlineKeyboardButton(f"📱 Prem Emoji: {s(PREMIUM_EMOJI_MODE)}", callback_data="tog_PREMIUM_EMOJI_MODE"),
+         InlineKeyboardButton(f"🎯 Prem Target: {s(PREMIUM_EMOJI_TARGET)}", callback_data="tog_PREMIUM_EMOJI_TARGET")],
+        [InlineKeyboardButton(f"🏷️ Mark Candle: {s(MARK_RESULT_CANDLE)}", callback_data="tog_MARK_RESULT_CANDLE"),
+         InlineKeyboardButton(f"📐 S/R Strategy: {s(SUPPORT_RESISTANCE_STRATEGY)}", callback_data="tog_SUPPORT_RESISTANCE_STRATEGY")],
+        [InlineKeyboardButton(f"📈 Trend Lines: {s(TREND_LINES)}", callback_data="tog_TREND_LINES"),
+         InlineKeyboardButton(f"📊 GAP Draw: {s(GAP_DRAWING)}", callback_data="tog_GAP_DRAWING")],
+        [InlineKeyboardButton(f"🔄 Rev Area: {s(REVERSE_AREA_DRAWING)}", callback_data="tog_REVERSE_AREA_DRAWING"),
+         InlineKeyboardButton(f"🎯 ST Strategy: {s(SUPERTREND_STRATEGY)}", callback_data="tog_SUPERTREND_STRATEGY")],
+        [InlineKeyboardButton("➡️ Page 2: Values & Intervals", callback_data="cmd_settings2")],
+        [InlineKeyboardButton("💾 Save Settings", callback_data="cmd_save"),
+         InlineKeyboardButton("◀️ Back", callback_data="cmd_refresh")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _tg_settings_keyboard2():
+    """Page 2 of 4 — Numeric Values & Intervals"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎯 Strategy: {CURRENT_STRATEGY}", callback_data="cmd_strategy_menu")],
+        [InlineKeyboardButton(f"🔢 Martingale: {MARTINGALE_STEPS} step(s)", callback_data="cmd_martingale_menu")],
+        [InlineKeyboardButton(f"⏱ Interval: {SIGNAL_INTERVAL_MIN//60}-{SIGNAL_INTERVAL_MAX//60}m", callback_data="cmd_interval_menu")],
+        [InlineKeyboardButton(f"📊 EMA Period: {EMA_PERIOD}", callback_data="edit_EMA_PERIOD"),
+         InlineKeyboardButton(f"📊 RSI Period: {RSI_PERIOD}", callback_data="edit_RSI_PERIOD")],
+        [InlineKeyboardButton(f"🏆 Min Score: {MIN_SIGNAL_SCORE}/5", callback_data="edit_MIN_SIGNAL_SCORE"),
+         InlineKeyboardButton(f"⏰ Partial: {PARTIAL_RESULTS_INTERVAL//60}m", callback_data="edit_PARTIAL_RESULTS_INTERVAL")],
+        [InlineKeyboardButton(f"🌅 BG Transparency: {BACKGROUND_TRANSPARENCY}%", callback_data="edit_BACKGROUND_TRANSPARENCY"),
+         InlineKeyboardButton(f"✨ Chart Glow: {CHART_TEXT_GLOW}%", callback_data="edit_CHART_TEXT_GLOW")],
+        [InlineKeyboardButton("➡️ Page 3: Text Labels", callback_data="cmd_settings3")],
+        [InlineKeyboardButton("◀️ Page 1: Toggles", callback_data="cmd_settings"),
+         InlineKeyboardButton("💾 Save", callback_data="cmd_save")],
+    ])
+
+def _tg_settings_keyboard3():
+    """Page 3 of 4 — Text & Label Inputs"""
+    def _t(s, n=14): return (s[:n] + "...") if len(s) > n else s
+    cl = _t(CUSTOM_LINK) if CUSTOM_LINK else "NOT SET"
+    cp = ", ".join(CUSTOM_PAIRS_LIST[:2]) + ("..." if len(CUSTOM_PAIRS_LIST) > 2 else "") if CUSTOM_PAIRS_LIST else "none"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💧 Watermark Text: {_t(WATERMARK_TEXT)}", callback_data="edit_WATERMARK_TEXT")],
+        [InlineKeyboardButton(f"📝 Signal Header: {_t(SIGNAL_HEADER_TEXT)}", callback_data="edit_SIGNAL_HEADER_TEXT")],
+        [InlineKeyboardButton(f"📊 Chart Header: {_t(CHART_HEADER_TEXT)}", callback_data="edit_CHART_HEADER_TEXT")],
+        [InlineKeyboardButton(f"🏷️ Result Footer: {_t(RESULT_FOOTER_TEXT)}", callback_data="edit_RESULT_FOOTER_TEXT")],
+        [InlineKeyboardButton(f"🔗 Custom Link: {cl}", callback_data="edit_CUSTOM_LINK")],
+        [InlineKeyboardButton(f"📋 Custom Pairs: {cp}", callback_data="edit_CUSTOM_PAIRS_LIST")],
+        [InlineKeyboardButton(f"👤 Signal Username: {SIGNAL_USERNAME}", callback_data="edit_SIGNAL_USERNAME")],
+        [InlineKeyboardButton(f"📢 Channel Chat ID: {TELEGRAM_CHAT_ID}", callback_data="edit_TELEGRAM_CHAT_ID")],
+        [InlineKeyboardButton("➡️ Page 4: Telegram Config", callback_data="cmd_settings4")],
+        [InlineKeyboardButton("◀️ Page 2: Values", callback_data="cmd_settings2"),
+         InlineKeyboardButton("💾 Save", callback_data="cmd_save")],
+    ])
+
+def _tg_settings_keyboard4():
+    """Page 4 of 4 — Telegram Config & Candle Colors"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🤖 Bot Token: {TELEGRAM_BOT_TOKEN[:12]}...", callback_data="edit_TELEGRAM_BOT_TOKEN")],
+        [InlineKeyboardButton(f"🆔 API ID: {TELEGRAM_API_ID}", callback_data="edit_TELEGRAM_API_ID"),
+         InlineKeyboardButton(f"🔑 API Hash: {str(TELEGRAM_API_HASH)[:8]}...", callback_data="edit_TELEGRAM_API_HASH")],
+        [InlineKeyboardButton(f"📱 Phone: {TELEGRAM_PHONE_NUMBER}", callback_data="edit_TELEGRAM_PHONE_NUMBER")],
+        [InlineKeyboardButton(f"📡 Source Ch: {str(TELEGRAM_SOURCE_CHANNEL)[:20]}", callback_data="edit_TELEGRAM_SOURCE_CHANNEL")],
+        [InlineKeyboardButton(f"📺 Target Chs: {str(TELEGRAM_TARGET_CHANNELS)[:20]}", callback_data="edit_TELEGRAM_TARGET_CHANNELS")],
+        [InlineKeyboardButton(f"🖼️ BG Image Path", callback_data="edit_CHART_BACKGROUND_IMAGE_PATH")],
+        [InlineKeyboardButton(f"🟢 Candle Up: RGB{CANDLE_UP_COLOR}", callback_data="edit_CANDLE_UP_COLOR")],
+        [InlineKeyboardButton(f"🔴 Candle Down: RGB{CANDLE_DOWN_COLOR}", callback_data="edit_CANDLE_DOWN_COLOR")],
+        [InlineKeyboardButton("◀️ Page 3: Text", callback_data="cmd_settings3"),
+         InlineKeyboardButton("💾 Save", callback_data="cmd_save")],
+    ])
+
+def _tg_strategy_keyboard():
+    rows = []
+    for st in AVAILABLE_STRATEGIES:
+        mark = "✅ " if st == CURRENT_STRATEGY else ""
+        rows.append([InlineKeyboardButton(f"{mark}{st}", callback_data=f"set_strategy_{st}")])
+    rows.append([InlineKeyboardButton("◀️ Back to Settings", callback_data="cmd_settings")])
+    return InlineKeyboardMarkup(rows)
+
+def _tg_martingale_keyboard():
+    rows = [[InlineKeyboardButton(f"{'✅ ' if MARTINGALE_STEPS==i else ''}{i} step{'s' if i!=1 else ''}", callback_data=f"set_martingale_{i}") for i in range(0, 4)]]
+    rows.append([InlineKeyboardButton("◀️ Back to Settings", callback_data="cmd_settings")])
+    return InlineKeyboardMarkup(rows)
+
+def _tg_interval_keyboard():
+    options = [(1, 2), (1, 3), (2, 5), (5, 10)]
+    rows = []
+    for mn, mx in options:
+        mark = "✅ " if SIGNAL_INTERVAL_MIN == mn*60 and SIGNAL_INTERVAL_MAX == mx*60 else ""
+        rows.append([InlineKeyboardButton(f"{mark}{mn}-{mx} min", callback_data=f"set_interval_{mn}_{mx}")])
+    rows.append([InlineKeyboardButton("◀️ Back to Settings", callback_data="cmd_settings")])
+    return InlineKeyboardMarkup(rows)
+
+def _tg_manual_keyboard():
+    rows = [
+        [InlineKeyboardButton("✅ WIN (Sure Shot)", callback_data="manual_win"),
+         InlineKeyboardButton("❌ LOSS", callback_data="manual_loss")],
+        [InlineKeyboardButton("◀️ Back", callback_data="cmd_refresh")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _build_status_text():
+    bd_time = datetime.now(pytz.timezone('Asia/Dhaka'))
+    confirmed = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+    today = [r for r in confirmed if r.get('date') == bd_time.date().isoformat()]
+    wins = sum(1 for t in today if t.get('result') == 'Profit')
+    losses = sum(1 for t in today if t.get('result') == 'Loss')
+    total = wins + losses
+    acc = f"{wins/total*100:.0f}%" if total > 0 else "0%"
+    status = "🟢 RUNNING" if bot_running else "🔴 STOPPED"
+    pending = [r for r in trade_results if r.get('result') is None]
+    return (
+        f"<b>🤖 NAGIIP DOLLAR x AI BOT</b>\n\n"
+        f"📡 Status: <b>{status}</b>\n"
+        f"🎯 Strategy: <b>{CURRENT_STRATEGY}</b>\n"
+        f"⚙️ Martingale: <b>{MARTINGALE_STEPS} step(s)</b>\n"
+        f"⏱ Interval: <b>{SIGNAL_INTERVAL_MIN//60}-{SIGNAL_INTERVAL_MAX//60} min</b>\n\n"
+        f"📅 Today ({bd_time.strftime('%Y-%m-%d')})\n"
+        f"✅ Wins: <b>{wins}</b>  ❌ Losses: <b>{losses}</b>  📊 Accuracy: <b>{acc}</b>\n"
+        f"⏳ Pending signals: <b>{len(pending)}</b>\n\n"
+        f"📷 Chart Photo: <b>{'ON' if SEND_PHOTO_WITH_SIGNAL else 'OFF'}</b>\n"
+        f"🌐 Pair Mode: <b>{'CUSTOM' if CUSTOM_PAIRS_MODE else ('ALL' if ANALYZE_ALL_PAIRS else 'EXCLUDE OTC LIST')}</b>\n"
+        f"📱 Premium Emoji: <b>{'ON' if PREMIUM_EMOJI_MODE else 'OFF'}</b>"
+    )
+
+async def _tg_answer(update, text, keyboard=None, parse_mode="HTML"):
+    """Helper: reply or edit existing message"""
+    try:
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=parse_mode)
+        else:
+            await update.message.reply_text(text, reply_markup=keyboard, parse_mode=parse_mode)
+    except Exception as e:
+        try:
+            if update.callback_query:
+                await update.callback_query.message.reply_text(text, reply_markup=keyboard, parse_mode=parse_mode)
+        except Exception:
+            pass
+
+async def tg_cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start and /menu commands — admin only."""
+    if not _is_admin(update):
+        return  # silently ignore non-admin
+    text = (
+        "<b>🤖 NAGIIP DOLLAR x AI BOT</b>\n"
+        "Professional Trading System\n\n"
+        "Choose an option from the menu below:"
+    )
+    await _tg_answer(update, text, _tg_main_keyboard())
+
+async def tg_cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await _tg_answer(update, _build_status_text(), _tg_main_keyboard())
+
+async def tg_callback(update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all inline keyboard callbacks — admin only."""
+    if not _is_admin(update):
+        try:
+            await update.callback_query.answer("⛔ Access denied.")
+        except Exception:
+            pass
+        return
+
+    global bot_running, CURRENT_STRATEGY, MARTINGALE_STEPS, SIGNAL_INTERVAL_MIN, SIGNAL_INTERVAL_MAX
+    global SEND_PHOTO_WITH_SIGNAL, ANALYZE_ALL_PAIRS, CUSTOM_PAIRS_MODE, BOT_ALERT_ON
+    global ADVANCED_ANALYSIS, SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SHOW_GRID_LINES
+    global PARABOLIC_SAR_LINES, FVG_GAP_DRAW, EMA_LINE_CHART, SUPERTREND_CHART, WATERMARK_ON
+    global SNR_LINES, PREMIUM_EMOJI_MODE
+
+    query = update.callback_query
+    data = query.data
+
+    if data == "cmd_refresh" or data == "cmd_start":
+        text = (
+            "<b>🤖 NAGIIP DOLLAR x AI BOT</b>\n"
+            "Professional Trading System\n\n"
+            "Choose an option from the menu below:"
+        )
+        await _tg_answer(update, text, _tg_main_keyboard())
+
+    elif data == "cmd_start_bot":
+        if not bot_running:
+            start_bot()
+            await _tg_answer(update, "✅ <b>Bot started successfully!</b>\n\nSignals will be sent to the channel.", _tg_main_keyboard())
+        else:
+            await _tg_answer(update, "ℹ️ Bot is already running.", _tg_main_keyboard())
+
+    elif data == "cmd_stop_bot":
+        stop_bot()
+        await _tg_answer(update, "⏹️ <b>Bot stopped.</b>", _tg_main_keyboard())
+
+    elif data == "cmd_partial":
+        send_partial_results()
+        await _tg_answer(update, "✅ Partial results sent to Telegram!", _tg_main_keyboard())
+
+    elif data == "cmd_status":
+        await _tg_answer(update, _build_status_text(), _tg_main_keyboard())
+
+    elif data == "cmd_settings":
+        await _tg_answer(update, "<b>⚙️ Settings</b>\n\nTap a button to toggle or change settings:", _tg_settings_keyboard())
+
+    elif data == "cmd_strategy_menu":
+        await _tg_answer(update, "<b>🎯 Choose Strategy</b>", _tg_strategy_keyboard())
+
+    elif data == "cmd_martingale_menu":
+        await _tg_answer(update, "<b>🔢 Choose Martingale Steps</b>", _tg_martingale_keyboard())
+
+    elif data == "cmd_interval_menu":
+        await _tg_answer(update, "<b>⏱ Choose Signal Interval</b>", _tg_interval_keyboard())
+
+    elif data == "cmd_save":
+        save_trade_results()
+        await _tg_answer(update, "✅ Settings and trade results saved!", _tg_settings_keyboard())
+
+    elif data == "cmd_manual_menu":
+        pending = [t for t in trade_results if t.get('result') is None]
+        if not pending:
+            await _tg_answer(update, "❌ No pending signals to send result for.", _tg_main_keyboard())
+        else:
+            last = pending[-1]
+            pair_disp = last.get('pair_display', last.get('pair', '')).replace('_otc', '-OTC').upper()
+            direction = last.get('direction', 'call').upper()
+            sig_time = last.get('signal_time', '??:??')
+            text = (
+                f"<b>📊 Send Manual Result</b>\n\n"
+                f"Last pending signal:\n"
+                f"🔸 Pair: <b>{pair_disp}</b>\n"
+                f"🔸 Direction: <b>{direction}</b>\n"
+                f"🔸 Time: <b>{sig_time}</b>\n\n"
+                f"Choose result:"
+            )
+            await _tg_answer(update, text, _tg_manual_keyboard())
+
+    elif data == "manual_win":
+        await _process_manual_result_tg(update, "Profit")
+
+    elif data == "manual_loss":
+        await _process_manual_result_tg(update, "Loss")
+
+    elif data.startswith("tog_"):
+        var_name = data[4:]
+        _toggle_setting(var_name)
+        await _tg_answer(update, "<b>⚙️ Settings</b>\n\nSetting updated! Tap a button to toggle or change settings:", _tg_settings_keyboard())
+
+    elif data.startswith("set_strategy_"):
+        CURRENT_STRATEGY = data[len("set_strategy_"):]
+        save_trade_results()
+        await _tg_answer(update, f"✅ Strategy set to <b>{CURRENT_STRATEGY}</b>", _tg_settings_keyboard())
+
+    elif data.startswith("set_martingale_"):
+        MARTINGALE_STEPS = int(data[len("set_martingale_"):])
+        save_trade_results()
+        await _tg_answer(update, f"✅ Martingale set to <b>{MARTINGALE_STEPS} step(s)</b>", _tg_settings_keyboard())
+
+    elif data.startswith("set_interval_"):
+        parts = data[len("set_interval_"):].split("_")
+        SIGNAL_INTERVAL_MIN = int(parts[0]) * 60
+        SIGNAL_INTERVAL_MAX = int(parts[1]) * 60
+        save_trade_results()
+        await _tg_answer(update, f"✅ Interval set to <b>{int(parts[0])}-{int(parts[1])} min</b>", _tg_settings_keyboard())
+
+    elif data == "cmd_settings2":
+        await _tg_answer(update, "<b>⚙️ Settings — Page 2: Values & Intervals</b>\n\nTap any button to edit:", _tg_settings_keyboard2())
+
+    elif data == "cmd_settings3":
+        await _tg_answer(update, "<b>⚙️ Settings — Page 3: Text & Labels</b>\n\nTap any button — then reply with the new text:", _tg_settings_keyboard3())
+
+    elif data == "cmd_settings4":
+        await _tg_answer(update, "<b>⚙️ Settings — Page 4: Telegram Config & Colors</b>\n\nTap any button — then reply with the new value:", _tg_settings_keyboard4())
+
+    elif data.startswith("edit_"):
+        setting_name = data[5:]
+        user_id = update.effective_user.id
+        _pending_input[user_id] = setting_name
+        prompts = {
+            "EMA_PERIOD": f"Reply with new EMA Period (number > 0).\nCurrent: <b>{EMA_PERIOD}</b>",
+            "RSI_PERIOD": f"Reply with new RSI Period (number > 0).\nCurrent: <b>{RSI_PERIOD}</b>",
+            "MIN_SIGNAL_SCORE": f"Reply with Min Signal Score (1-5).\nCurrent: <b>{MIN_SIGNAL_SCORE}</b>",
+            "PARTIAL_RESULTS_INTERVAL": f"Reply with Partial Results Interval in <b>minutes</b> (1-60).\nCurrent: <b>{PARTIAL_RESULTS_INTERVAL//60} min</b>",
+            "BACKGROUND_TRANSPARENCY": f"Reply with Background Transparency (0-100)%.\nCurrent: <b>{BACKGROUND_TRANSPARENCY}%</b>",
+            "CHART_TEXT_GLOW": f"Reply with Chart Text Glow (0-100)%.\nCurrent: <b>{CHART_TEXT_GLOW}%</b>",
+            "WATERMARK_TEXT": f"Reply with new Watermark Text.\nCurrent: <b>{WATERMARK_TEXT}</b>",
+            "SIGNAL_HEADER_TEXT": f"Reply with new Signal Header Text.\nCurrent: <b>{SIGNAL_HEADER_TEXT}</b>",
+            "CHART_HEADER_TEXT": f"Reply with new Chart Header Text.\nCurrent: <b>{CHART_HEADER_TEXT}</b>",
+            "RESULT_FOOTER_TEXT": f"Reply with new Result Footer.\n• Plain word (e.g. NAGIIP) → auto-styled\n• Full text → used as-is\nCurrent: <b>{RESULT_FOOTER_TEXT}</b>",
+            "CUSTOM_LINK": f"Reply with new Custom Link (or 'clear' to remove).\nCurrent: <b>{CUSTOM_LINK or 'NOT SET'}</b>",
+            "CUSTOM_PAIRS_LIST": f"Reply with pairs comma-separated.\nExample: BRLUSD_otc,USDPKR_otc\nCurrent: <b>{', '.join(CUSTOM_PAIRS_LIST)}</b>",
+            "SIGNAL_USERNAME": f"Reply with new Signal Username (e.g. @mybot).\nCurrent: <b>{SIGNAL_USERNAME}</b>",
+            "TELEGRAM_CHAT_ID": f"Reply with new Channel Chat ID.\nCurrent: <b>{TELEGRAM_CHAT_ID}</b>",
+            "TELEGRAM_BOT_TOKEN": "Reply with new Telegram Bot Token.",
+            "TELEGRAM_API_ID": f"Reply with new Telegram API ID (number).\nCurrent: <b>{TELEGRAM_API_ID}</b>",
+            "TELEGRAM_API_HASH": "Reply with new Telegram API Hash.",
+            "TELEGRAM_PHONE_NUMBER": f"Reply with new Phone Number (e.g. +1234567890).\nCurrent: <b>{TELEGRAM_PHONE_NUMBER}</b>",
+            "TELEGRAM_SOURCE_CHANNEL": f"Reply with new Source Channel.\nCurrent: <b>{TELEGRAM_SOURCE_CHANNEL}</b>",
+            "TELEGRAM_TARGET_CHANNELS": f"Reply with Target Channel IDs, comma-separated.\nCurrent: <b>{TELEGRAM_TARGET_CHANNELS}</b>",
+            "CHART_BACKGROUND_IMAGE_PATH": f"Reply with full path to background image (or 'clear').\nCurrent: <b>{CHART_BACKGROUND_IMAGE_PATH or 'NOT SET'}</b>",
+            "CANDLE_UP_COLOR": f"Reply with Up Candle Color as R,G,B (e.g. 0,200,0).\nCurrent: <b>RGB{CANDLE_UP_COLOR}</b>",
+            "CANDLE_DOWN_COLOR": f"Reply with Down Candle Color as R,G,B (e.g. 255,50,50).\nCurrent: <b>RGB{CANDLE_DOWN_COLOR}</b>",
+        }
+        prompt = prompts.get(setting_name, f"Reply with the new value for <b>{setting_name}</b>:")
+        try:
+            await query.answer()
+            await query.message.reply_text(f"✏️ <b>Edit: {setting_name}</b>\n\n{prompt}", parse_mode="HTML")
+        except Exception:
+            pass
+
+def _toggle_setting(var_name):
+    """Toggle a boolean global setting by name — covers all terminal toggles"""
+    global SEND_PHOTO_WITH_SIGNAL, ANALYZE_ALL_PAIRS, CUSTOM_PAIRS_MODE, BOT_ALERT_ON
+    global ADVANCED_ANALYSIS, SUPPORT_RESISTANCE_LINES, MOVING_AVERAGE_LINES, SHOW_GRID_LINES
+    global PARABOLIC_SAR_LINES, FVG_GAP_DRAW, EMA_LINE_CHART, SUPERTREND_CHART, WATERMARK_ON
+    global SNR_LINES, PREMIUM_EMOJI_MODE, SUPERTREND_STRATEGY, REVERSE_AREA_DRAWING, GAP_DRAWING
+    global SHOW_PRICE_SCALE, TREND_LINES, MARK_RESULT_CANDLE, SUPPORT_RESISTANCE_STRATEGY
+    global PREMIUM_EMOJI_TARGET
+    allowed = {
+        "SEND_PHOTO_WITH_SIGNAL", "ANALYZE_ALL_PAIRS", "CUSTOM_PAIRS_MODE", "BOT_ALERT_ON",
+        "ADVANCED_ANALYSIS", "SUPPORT_RESISTANCE_LINES", "MOVING_AVERAGE_LINES", "SHOW_GRID_LINES",
+        "PARABOLIC_SAR_LINES", "FVG_GAP_DRAW", "EMA_LINE_CHART", "SUPERTREND_CHART", "WATERMARK_ON",
+        "SNR_LINES", "PREMIUM_EMOJI_MODE", "SUPERTREND_STRATEGY", "REVERSE_AREA_DRAWING", "GAP_DRAWING",
+        "SHOW_PRICE_SCALE", "TREND_LINES", "MARK_RESULT_CANDLE", "SUPPORT_RESISTANCE_STRATEGY",
+        "PREMIUM_EMOJI_TARGET",
+    }
+    if var_name in allowed:
+        g = globals()
+        g[var_name] = not g[var_name]
+        save_trade_results()
+
+def _apply_text_setting(setting, value):
+    """Apply a text/number setting from Telegram reply. Returns (success, html_message)."""
+    global EMA_PERIOD, RSI_PERIOD, MIN_SIGNAL_SCORE, PARTIAL_RESULTS_INTERVAL
+    global BACKGROUND_TRANSPARENCY, CHART_TEXT_GLOW, WATERMARK_TEXT, SIGNAL_HEADER_TEXT
+    global CHART_HEADER_TEXT, RESULT_FOOTER_TEXT, CUSTOM_LINK, CUSTOM_PAIRS_LIST
+    global SIGNAL_USERNAME, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID
+    global TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER, TELEGRAM_SOURCE_CHANNEL, TELEGRAM_TARGET_CHANNELS
+    global CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, CHART_BACKGROUND_IMAGE_PATH, bot
+    try:
+        if setting == "EMA_PERIOD":
+            v = int(value)
+            if v <= 0: return False, "❌ Must be greater than 0"
+            EMA_PERIOD = v
+            return True, f"✅ EMA Period set to <b>{v}</b>"
+        elif setting == "RSI_PERIOD":
+            v = int(value)
+            if v <= 0: return False, "❌ Must be greater than 0"
+            RSI_PERIOD = v
+            return True, f"✅ RSI Period set to <b>{v}</b>"
+        elif setting == "MIN_SIGNAL_SCORE":
+            v = int(value)
+            if not (1 <= v <= 5): return False, "❌ Must be 1 to 5"
+            MIN_SIGNAL_SCORE = v
+            return True, f"✅ Min Signal Score set to <b>{v}</b>"
+        elif setting == "PARTIAL_RESULTS_INTERVAL":
+            v = int(value)
+            if not (1 <= v <= 60): return False, "❌ Must be 1–60 (minutes)"
+            PARTIAL_RESULTS_INTERVAL = v * 60
+            return True, f"✅ Partial Results Interval set to <b>{v} minutes</b>"
+        elif setting == "BACKGROUND_TRANSPARENCY":
+            v = int(value)
+            if not (0 <= v <= 100): return False, "❌ Must be 0–100"
+            BACKGROUND_TRANSPARENCY = v
+            return True, f"✅ Background Transparency set to <b>{v}%</b>"
+        elif setting == "CHART_TEXT_GLOW":
+            v = int(value)
+            if not (0 <= v <= 100): return False, "❌ Must be 0–100"
+            CHART_TEXT_GLOW = v
+            return True, f"✅ Chart Text Glow set to <b>{v}%</b>"
+        elif setting == "WATERMARK_TEXT":
+            WATERMARK_TEXT = value
+            return True, f"✅ Watermark Text: <b>{value}</b>"
+        elif setting == "SIGNAL_HEADER_TEXT":
+            SIGNAL_HEADER_TEXT = value
+            return True, f"✅ Signal Header: <b>{value}</b>"
+        elif setting == "CHART_HEADER_TEXT":
+            CHART_HEADER_TEXT = value
+            return True, f"✅ Chart Header: <b>{value}</b>"
+        elif setting == "RESULT_FOOTER_TEXT":
+            import re as _re
+            if _re.match(r"^[A-Za-z0-9]+$", value):
+                letters = " | ".join(list(value.upper()))
+                RESULT_FOOTER_TEXT = f"\U00012194\u2022\u2014\u2014\u203c\ufe0f {letters} \u203c\ufe0f\u2014\u2014\u2022\U00012194"
+            else:
+                RESULT_FOOTER_TEXT = value
+            return True, f"✅ Result Footer updated: <b>{RESULT_FOOTER_TEXT}</b>"
+        elif setting == "CUSTOM_LINK":
+            if value.lower() == "clear":
+                CUSTOM_LINK = ""
+                return True, "✅ Custom Link cleared"
+            CUSTOM_LINK = value
+            return True, f"✅ Custom Link: <b>{value}</b>"
+        elif setting == "CUSTOM_PAIRS_LIST":
+            pairs = [p.strip() for p in value.split(',') if p.strip()]
+            if not pairs: return False, "❌ No valid pairs found"
+            CUSTOM_PAIRS_LIST = pairs
+            return True, f"✅ Custom Pairs: <b>{', '.join(pairs)}</b>"
+        elif setting == "SIGNAL_USERNAME":
+            SIGNAL_USERNAME = value
+            return True, f"✅ Signal Username: <b>{value}</b>"
+        elif setting == "TELEGRAM_CHAT_ID":
+            TELEGRAM_CHAT_ID = value
+            return True, f"✅ Telegram Chat ID: <b>{value}</b>"
+        elif setting == "TELEGRAM_BOT_TOKEN":
+            TELEGRAM_BOT_TOKEN = value
+            bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+            return True, "✅ Bot Token updated (restart bot to apply fully)"
+        elif setting == "TELEGRAM_API_ID":
+            TELEGRAM_API_ID = int(value)
+            return True, f"✅ Telegram API ID: <b>{value}</b>"
+        elif setting == "TELEGRAM_API_HASH":
+            TELEGRAM_API_HASH = value
+            return True, "✅ Telegram API Hash updated"
+        elif setting == "TELEGRAM_PHONE_NUMBER":
+            TELEGRAM_PHONE_NUMBER = value
+            return True, f"✅ Phone Number: <b>{value}</b>"
+        elif setting == "TELEGRAM_SOURCE_CHANNEL":
+            TELEGRAM_SOURCE_CHANNEL = value
+            return True, f"✅ Source Channel: <b>{value}</b>"
+        elif setting == "TELEGRAM_TARGET_CHANNELS":
+            targets = [int(x.strip()) for x in value.split(',')]
+            TELEGRAM_TARGET_CHANNELS = targets
+            return True, f"✅ Target Channels: <b>{targets}</b>"
+        elif setting == "CANDLE_UP_COLOR":
+            r, g, b = map(int, value.split(','))
+            if not all(0 <= x <= 255 for x in [r, g, b]): return False, "❌ Each value must be 0–255"
+            CANDLE_UP_COLOR = (r, g, b)
+            return True, f"✅ Candle Up Color: <b>RGB({r},{g},{b})</b>"
+        elif setting == "CANDLE_DOWN_COLOR":
+            r, g, b = map(int, value.split(','))
+            if not all(0 <= x <= 255 for x in [r, g, b]): return False, "❌ Each value must be 0–255"
+            CANDLE_DOWN_COLOR = (r, g, b)
+            return True, f"✅ Candle Down Color: <b>RGB({r},{g},{b})</b>"
+        elif setting == "CHART_BACKGROUND_IMAGE_PATH":
+            if value.lower() == "clear":
+                CHART_BACKGROUND_IMAGE_PATH = ""
+                return True, "✅ Background image path cleared (solid black)"
+            CHART_BACKGROUND_IMAGE_PATH = value
+            return True, f"✅ Background Image Path: <b>{value}</b>"
+        else:
+            return False, f"❌ Unknown setting: <b>{setting}</b>"
+    except Exception as ex:
+        return False, f"❌ Invalid input: {ex}"
+
+async def _process_manual_result_tg(update, result):
+    """Process manual win/loss from Telegram callback"""
+    pending_trades = [t for t in trade_results if t.get('result') is None]
+    if not pending_trades:
+        await _tg_answer(update, "❌ No pending signals found.", _tg_main_keyboard())
+        return
+
+    last_trade = pending_trades[-1]
+    last_trade_index = trade_results.index(last_trade)
+    pair_display = last_trade.get('pair_display', last_trade['pair'])
+
+    temp = [t for i, t in enumerate(trade_results) if i < last_trade_index and t.get('result') in ['Profit', 'Loss']]
+    today_before = [t for t in temp if t.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+    wins = sum(1 for t in today_before if t.get('result') == 'Profit')
+    losses = sum(1 for t in today_before if t.get('result') == 'Loss')
+
+    if result == "Profit":
+        wins += 1
+        result_text = "✅✅✅ 𝗦𝗨𝗥𝗘 𝗦𝗛𝗢𝗧 ✅✅✅"
+    else:
+        losses += 1
+        result_text = "✖️✖️✖️ 𝗟𝗢𝗦𝗦 ✖️✖️✖️"
+
+    trade_results[last_trade_index]['result'] = result
+    trade_results[last_trade_index]['profit'] = 10.0 if result == "Profit" else -7.0
+    trade_results[last_trade_index]['martingale_step'] = 0
+    save_trade_results()
+
+    total = wins + losses
+    win_rate = f"{wins/total*100:.0f}%" if total > 0 else "0%"
+    icon = "✅" if result == "Profit" else "❌"
+    msg_text = (
+        f"{icon} Manual result sent!\n\n"
+        f"Pair: <b>{pair_display}</b>\n"
+        f"Result: <b>{result}</b>\n"
+        f"Wins: {wins}  |  Losses: {losses}  |  Accuracy: {win_rate}"
+    )
+    await _tg_answer(update, msg_text, _tg_main_keyboard())
+
+    send_telegram_message(
+        f"<b>𒆜•——‼️ 𝚁 | 𝙴 | 𝚂 | 𝚄 | 𝙻 | 𝚃 ‼️——•𒆜\n\n"
+        f"📊 {pair_display}  |  🕓 {last_trade.get('signal_time','??:??')}\n"
+        f"{result_text}\n"
+        f"🏆 Win:{wins} ┃ ✖️Loss:{losses} ◈ {win_rate}\n\n"
+        f"🌐 {SIGNAL_USERNAME}\n{RESULT_FOOTER_TEXT}</b>"
+    )
+
+async def tg_cmd_startbot(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    if not bot_running:
+        start_bot()
+        await _tg_answer(update, "✅ <b>Bot started!</b>\n\nSignals will be sent to the channel.", _tg_main_keyboard())
+    else:
+        await _tg_answer(update, "ℹ️ Bot is already running.", _tg_main_keyboard())
+
+async def tg_cmd_stopbot(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    stop_bot()
+    await _tg_answer(update, "⏹️ <b>Bot stopped.</b>", _tg_main_keyboard())
+
+async def tg_cmd_results(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    send_partial_results()
+    await _tg_answer(update, "✅ Partial results sent to channel!", _tg_main_keyboard())
+
+async def tg_cmd_reset(update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    global trade_results
+    today_str = datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
+    trade_results = [r for r in trade_results if r.get('date') != today_str]
+    save_trade_results()
+    await _tg_answer(update, "✅ Today's trade results have been reset.", _tg_main_keyboard())
+
+async def tg_unknown_cmd(update, context: ContextTypes.DEFAULT_TYPE):
+    """Silently ignore all unknown commands from non-admins."""
+    if not _is_admin(update):
+        return
+    await _tg_answer(update, "❓ Unknown command. Use /menu to open the control panel.", _tg_main_keyboard())
+
+async def tg_handle_text(update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text replies — used for editable settings input."""
+    if not _is_admin(update):
+        return
+    user_id = update.effective_user.id
+    if user_id not in _pending_input:
+        return  # not waiting for any input, silently ignore
+    setting = _pending_input.pop(user_id)
+    value = (update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text("❌ Empty value — setting not changed.", parse_mode="HTML")
+        return
+    success, msg = _apply_text_setting(setting, value)
+    if success:
+        save_trade_results()
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+def _build_tg_app():
+    """Build and return a configured Application instance."""
+    from telegram.ext import MessageHandler, filters as tg_filters
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler(["start", "menu", "help"], tg_cmd_start))
+    app.add_handler(CommandHandler("status", tg_cmd_status))
+    app.add_handler(CommandHandler("startbot", tg_cmd_startbot))
+    app.add_handler(CommandHandler("stopbot", tg_cmd_stopbot))
+    app.add_handler(CommandHandler(["results", "partialresults"], tg_cmd_results))
+    app.add_handler(CommandHandler("reset", tg_cmd_reset))
+    app.add_handler(CallbackQueryHandler(tg_callback))
+    app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, tg_handle_text))
+    return app
+
+def run_telegram_command_bot():
+    """Run the Telegram command bot once (blocking). Returns on error."""
+    import traceback
+    try:
+        app = _build_tg_app()
+        print(rainbow_text("🤖 Telegram command bot polling started. Waiting for /menu..."))
+        app.run_polling(drop_pending_updates=True, stop_signals=None)
+        print(rainbow_text("⚠️ Telegram polling returned (unexpected)."))
+    except Exception as e:
+        print(rainbow_text(f"❌ Telegram command bot error: {e}"))
+        traceback.print_exc()
+
+def start_telegram_command_bot(daemon=True):
+    """Start Telegram command bot in a background thread (call once at startup)."""
+    global _tg_app_thread
+    import threading as _th
+    if _tg_app_thread and _tg_app_thread.is_alive():
+        return
+    _tg_app_thread = _th.Thread(target=run_telegram_command_bot, daemon=daemon, name="TelegramCmdBot")
+    _tg_app_thread.start()
+    print(rainbow_text("📱 Telegram command bot thread started."))
+
+# ================= END TELEGRAM BOT COMMAND INTERFACE =================
+
+# ================= ম্যানুয়াল রেজাল্ট ফাংশন =================
+
+def send_manual_result():
+    global SEND_PHOTO_WITH_SIGNAL, CHART_BACKGROUND_IMAGE_PATH, SIGNAL_USERNAME
+    
+    # Only consider trades that are currently pending (result is None)
+    pending_trades = [t for t in trade_results if t.get('result') is None]
+
+    if not pending_trades:
+        print(rainbow_text("❌ 𝙽𝚘 𝚙𝚎𝚗𝚍𝚒𝚗𝚐 𝚜𝚒𝚐𝚗𝚊𝚕𝚜 𝚝𝚘 𝚜𝚎𝚗𝚍 𝚛𝚎𝚜𝚞𝚕𝚝 𝚏𝚘𝚛."))
+        return
+
+    print("\n" + "="*52)
+    print(rainbow_text("📊 𝚂𝚎𝚗𝚍 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝 𝚖𝚊𝚗𝚞𝚊𝚕𝚕𝚢"))
+    print("="*52)
+
+    # Show the last 5 pending trades
+    for i, trade in enumerate(pending_trades[-5:], 1):
+        pair_display = trade.get('pair_display', trade['pair'])
+        print(rainbow_text(f"{i}. {pair_display} - {trade['direction']} - {trade['signal_time']} - ⏳ 𝙿𝚎𝚗𝚍𝚒𝚗𝚐"))
+
+    last_trade = pending_trades[-1]
+    last_trade_index = trade_results.index(last_trade) # Find the index in the main list
+
+    print(rainbow_text("\n𝟷. ✅ 𝚂𝚎𝚗𝚍 𝚠𝚒𝚗𝚗𝚒𝚗𝚐 𝚛𝚎𝚜𝚞𝚕𝚝 (𝚂𝚞𝚛𝚎 𝚂𝚑𝚘𝚝) 𝚏𝚘𝚛 𝚕𝚊𝚜𝚝 𝚙𝚎𝚗𝚍𝚒𝚗𝚐 𝚜𝚒𝚐𝚗𝚊𝚕"))
+    print(rainbow_text("𝟸. ❌ 𝚂𝚎𝚗𝚍 𝚕𝚘𝚜𝚒𝚗𝚐 𝚛𝚎𝚜𝚞𝚕𝚝 (𝚂𝚞𝚛𝚎 𝚂𝚑𝚘𝚝 𝙻𝚘𝚜𝚜) 𝚏𝚘𝚛 𝚕𝚊𝚜𝚝 𝚙𝚎𝚗𝚍𝚒𝚗𝚐 𝚜𝚒𝚐𝚗𝚊𝚕"))
+    print(rainbow_text("𝟹. ↩️ 𝙱𝚊𝚌𝚔 𝚝𝚘 𝚖𝚊𝚒𝚗 𝚖𝚎𝚗𝚞"))
+
+    choice = input(rainbow_text("𝙲𝚑𝚘𝚘𝚜𝚎 𝚘𝚙𝚝𝚒𝚘𝚗: ")).strip()
+
+    if choice in ("1", "2"):
+        pair_display = last_trade.get('pair_display', last_trade['pair'])
+
+        # Get stats BEFORE updating the last trade's result
+        temp_trades = [t for i, t in enumerate(trade_results) if i < last_trade_index and t.get('result') in ['Profit', 'Loss']]
+        today_trades_before = [t for t in temp_trades if t.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+        today_stats = get_statistics(today_trades_before) # Stats before current trade is counted
+
+        wins = today_stats['wins']
+        losses = today_stats['losses']
+
+        if choice == "1":
+            result = "Profit"
+            wins += 1
+            result_text = "✅✅✅ 𝚂𝚄𝚁𝙴 𝚂𝙷𝙾𝚃 ✅✅✅"
+        elif choice == "2":
+            result = "Loss"
+            losses += 1
+            result_text = "✖️✖️✖️ 𝙻𝙾𝚂𝚂 ✖️✖️✖️"
+
+        # Update the trade in the main list
+        trade_results[last_trade_index]['result'] = result
+        trade_results[last_trade_index]['profit'] = 10.0 if result == "Profit" else -7.0  # ফিক্সড ভ্যালু
+        trade_results[last_trade_index]['martingale_step'] = 0
+        save_trade_results()
+
+        wins_formatted = fancy_font(str(wins))
+        losses_formatted = fancy_font(str(losses))
+        total_today = wins + losses
+        win_rate_today = (wins / total_today * 100) if total_today > 0 else 0
+        win_rate_formatted = fancy_font(f"{win_rate_today:.1f}")
+
+        result_msg = f"""𒆜☲☲☲ 𝚁╎𝙴╎𝚂╎𝚄╎𝙻╎𝚃 ☲☲☲☲𒆜
+
+╭━━━━━━━【⛨】━━━━━━━╮
+{'💰' if result == 'Profit' else '📉'} {fancy_font(pair_display)} ┃ 🕓{last_trade['signal_time']}|
+╰━━━━━━━【⛨】━━━━━━━╯
+{result_text}
+
+╭━━━━━━━【⛨】━━━━━━━╮
+🔥 𝚆𝚒𝚗:{wins_formatted} | ☃️ 𝙻𝚘𝚜𝚜:{losses_formatted} ◈ ({win_rate_formatted}％)
+╰━━━━━━━【⛨】━━━━━━━╯
+📊 𝚃𝙾𝙳𝙰𝚈: {wins_formatted}W/{losses_formatted}L ({win_rate_formatted}％)
+🌐 𝙲𝚘𝚗𝚝𝚊𝚌𝚝: {SIGNAL_USERNAME}
+
+☲☲☲_ 【 𝐀𝙸 𝐒𝙸𝙶𝙽𝙰𝐋 𝐐𝚇 】☲☲☲☲"""
+
+        # ম্যানুয়াল ফলাফল পাঠানোর লজিক
+        asyncio.run(send_telegram_photo_or_chart(result_msg, last_trade['pair'], None, result=result))
+
+        print((rainbow_text(f"✅ 𝙼𝚊𝚗𝚞𝚊𝚕 {result} 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚙𝚘𝚛𝚝 𝚜𝚎𝚗𝚝 𝚏𝚘𝚛 {pair_display}")))
+
+    elif choice == "3":
+        return
+    else:
+        print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚘𝚙𝚝𝚒𝚘𝚕"))
+
+def show_partial_results():
+    if not trade_results:
+        print(rainbow_text("📊 𝙽𝚘 𝚝𝚛𝚊𝚍𝚎𝚜 𝚢𝚎𝚝"))
+        return
+
+    bd_time = datetime.now(pytz.timezone('Asia/Dhaka'))
+    today_date = bd_time.strftime("%d．%m．%Y")
+
+    # Only include confirmed trades
+    confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+    today_trades = [r for r in confirmed_trades if r.get('date') == bd_time.date().isoformat()]
+
+    otc_trades = [t for t in today_trades if 'OTC' in t.get('pair_display', '').upper() or '_otc' in t.get('pair', '').lower()]
+    real_trades = [t for t in today_trades if not ('OTC' in t.get('pair_display', '').upper() or '_otc' in t.get('pair', '').lower())]
+
+    def count_wins_losses(trades):
+        wins = sum(1 for t in trades if t.get('result') == 'Profit')
+        losses = sum(1 for t in trades if t.get('result') == 'Loss')
+        return wins, losses
+
+    otc_wins, otc_losses = count_wins_losses(otc_trades)
+    real_wins, real_losses = count_wins_losses(real_trades)
+
+    print("\n" + "="*52)
+    print(rainbow_text("📊 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚛𝚎𝚜𝚞𝚕𝚝𝚜"))
+    print("="*52)
+    print(rainbow_text(f"📅 𝙳𝚊𝚝𝚎: {today_date}"))
+    print(rainbow_text(f"📈 𝚃𝚘𝚝𝚊𝚕 𝚜𝚒𝚐𝚗𝚊𝚕𝚜 𝚜𝚎𝚗𝚝: {len(trade_results)}"))
+    print(rainbow_text(f"📊 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚝𝚛𝚊𝚍𝚎𝚜 (𝙲𝚘𝚗𝚏𝚒𝚛𝚖𝚎𝚍): {len(today_trades)}"))
+    print(rainbow_text(f"📉 𝙾𝚃𝙲 𝚝𝚛𝚊𝚍𝚎𝚜 (𝙲𝚘𝚗𝚏𝚒𝚛𝚖𝚎𝚚): {len(otc_trades)}"))
+    print(rainbow_text(f"📈 𝚁𝚎𝚊𝚕 𝚝𝚛𝚊𝚍𝚎𝚜 (𝙲𝚘𝚗𝚏𝚒𝚛𝚖𝚎𝚍): {len(real_trades)}"))
+
+    if otc_trades:
+        otc_total = otc_wins + otc_losses
+        otc_win_rate = (otc_wins / otc_total * 100) if otc_total > 0 else 0
+        print(rainbow_text(f"\n📊 𝙾𝚃𝙲 𝙼𝚊𝚛𝚔𝚎𝚝 𝚂𝚝𝚊𝚝𝚒𝚜𝚝𝚒𝚌𝚜:"))
+        print(rainbow_text(f"✅ 𝚆𝚒𝚗𝚗𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎𝚜: {otc_wins}"))
+        print(rainbow_text(f"❌ 𝙻𝚘𝚜𝚜𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎𝚜: {otc_losses}"))
+        print(rainbow_text(f"📊 𝚆𝚒𝚗 𝚛𝚊𝚝𝚎: {otc_win_rate:.1f}%"))
+
+    if real_trades:
+        real_total = real_wins + real_losses
+        real_win_rate = (real_wins / real_total * 100) if real_total > 0 else 0
+        print(rainbow_text(f"\n📊 𝚁𝚎𝚊𝚕 𝙼𝚊𝚛𝚔𝚎𝚟 𝚂𝚝𝚊𝚝𝚒𝚜𝚝𝚒𝚌𝚜:"))
+        print(rainbow_text(f"✅ 𝚆𝚒𝚗𝚗𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎𝚜: {real_wins}"))
+        print(rainbow_text(f"❌ 𝙻𝚘𝚜𝚜𝚒𝚗𝚐 𝚝𝚛𝚊𝚍𝚎𝚜: {real_losses}"))
+        print(rainbow_text(f"📊 𝚆𝚒𝚗 𝚛𝚊𝚝𝚎: {real_win_rate:.1f}%"))
+
+    input(rainbow_text("\n𝙿𝚛𝚎𝚜𝚜 𝙴𝚗𝚝𝚎𝚛 𝚝𝚘 𝚌𝚘𝚗𝚝𝚒𝚗𝚞𝚎..."))
+
+# ================= ক্লিন স্ক্রিন ফাংশন =================
+
+def clear_screen():
+    """ক্লিন স্ক্রিন ফাংশন"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+# ================= সেটিংস মেনু (আপডেট) =================
+
+def settings_menu():
+    global MARTINGALE_STEPS, PARTIAL_RESULTS_INTERVAL, SEND_PHOTO_WITH_SIGNAL, CHART_BACKGROUND_IMAGE_PATH
+    global ANALYZE_ALL_PAIRS, CUSTOM_PAIRS_MODE, CUSTOM_PAIRS_LIST, EMA_PERIOD, RSI_PERIOD
+    global CURRENT_STRATEGY, MARK_RESULT_CANDLE, MIN_SIGNAL_SCORE, SUPPORT_RESISTANCE_LINES
+    global MOVING_AVERAGE_LINES, SUPPORT_RESISTANCE_STRATEGY, SHOW_GRID_LINES, SHOW_PRICE_SCALE
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SIGNAL_USERNAME, SIGNAL_INTERVAL_MIN
+    global SIGNAL_INTERVAL_MAX, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
+    global TELEGRAM_SOURCE_CHANNEL, TELEGRAM_TARGET_CHANNELS, PREMIUM_EMOJI_MODE, PREMIUM_EMOJI_TARGET
+    global TREND_LINES, BACKGROUND_TRANSPARENCY, CHART_TEXT_GLOW, WATERMARK_ON, WATERMARK_TEXT
+    global SIGNAL_HEADER_TEXT, CHART_HEADER_TEXT, RESULT_FOOTER_TEXT
+    global PARABOLIC_SAR_LINES, GAP_DRAWING, REVERSE_AREA_DRAWING, ADVANCED_ANALYSIS, CUSTOM_LINK
+    global FVG_GAP_DRAW, BOT_ALERT_ON, CANDLE_UP_COLOR, CANDLE_DOWN_COLOR, EMA_LINE_CHART
+    global SUPERTREND_CHART, SUPERTREND_STRATEGY, SNR_LINES
+
+    while True:
+        clear_screen()
+        print("\n" + "="*60)
+        print(rainbow_text("⚙️ 𝚂𝙴𝚃𝚃𝙸𝙽𝙶𝚂 𝙼𝙴𝙽𝚄"))
+        print("="*60)
+        
+        colors = [Fore.RED, Fore.YELLOW, Fore.GREEN, Fore.CYAN, Fore.BLUE, Fore.MAGENTA]
+        
+        options = [
+            f"𝟷. 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎 𝚂𝚝𝚎𝚙𝚜: {MARTINGALE_STEPS}",
+            f"𝟸. 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚁𝚎𝚜𝚞𝚕𝚝𝚜 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕: {PARTIAL_RESULTS_INTERVAL} 𝚜𝚎𝚌𝚘𝚗𝚍𝚜 ({PARTIAL_RESULTS_INTERVAL//60} 𝚖𝚒𝚗𝚞𝚝𝚎𝚜)",
+            f"𝟹. 𝚂𝚒𝚐𝚗𝚊𝚕 𝙿𝚑𝚘𝚝𝚘 𝙼𝚘𝚍𝚎: {'✅ ' if SEND_PHOTO_WITH_SIGNAL else '❌ '} {'𝙼𝚊𝚛𝚔𝚎𝚝 𝙲𝚑𝚊𝚛𝚝 𝙿𝚑𝚘𝚝𝚘' if SEND_PHOTO_WITH_SIGNAL else '𝚃𝚎𝚡𝚝 𝙾𝚗𝚕𝚢'}",
+            f"𝟺. 𝙲𝚑𝚊𝚛𝚝 𝙱𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝙿𝚑𝚘𝚝𝚘 𝙿𝚊𝚝𝚑: {CHART_BACKGROUND_IMAGE_PATH[:40]}...",
+            f"𝟻. 𝙰𝚗𝚊𝚕𝚢𝚣𝚎 𝙰𝚕𝚕 𝙿𝚊𝚒𝚛𝚜: {'✅ 𝙾𝙽' if ANALYZE_ALL_PAIRS else '❌ 𝙾𝙵𝙵 (𝙴𝚡𝚌𝚕𝚞𝚍𝚎 𝙻𝚒𝚜𝚝 𝙰𝚙𝚙𝚕𝚒𝚎𝚡)'}",
+            f"𝟼. 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛 𝙼𝚘𝚍𝚎: {'✅ 𝙾𝙽' if CUSTOM_PAIRS_MODE else '❌ 𝙾𝙵𝙵'} ({'𝙲𝚄𝚂𝚃𝙾𝙼 𝙿𝙰𝙸𝚁𝚂 𝙾𝙽𝙻𝚈' if CUSTOM_PAIRS_MODE else '𝙰𝚄𝚃𝙾 𝙵𝙸𝙽𝙳 𝙿𝙰𝙸𝚁𝚂'})",
+            f"𝟽. 𝚂𝚎𝚝 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛𝚜 𝙻𝚒𝚜𝚝: [{', '.join(CUSTOM_PAIRS_LIST[:2])}{'...' if len(CUSTOM_PAIRS_LIST) > 2 else ''}]",
+            f"𝟾. 𝙴𝙼𝙰 𝙿𝚎𝚛𝚒𝚘𝚍: {EMA_PERIOD}",
+            f"𝟿. 𝚁𝚂𝙸 𝙿𝚎𝚛𝚒𝚘𝚍: {RSI_PERIOD}",
+            f"𝟷𝟶. 𝙲𝚞𝚛𝚛𝚎𝚗𝚝 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {CURRENT_STRATEGY}",
+            f"𝟷𝟷. 𝙼𝚊𝚛𝚔 𝚁𝚎𝚜𝚞𝚕𝚝 𝙲𝚊𝚗𝚍𝚕𝚎: {'✅ 𝙾𝙽' if MARK_RESULT_CANDLE else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟸. 𝙼𝚒??𝚒𝚖𝚞𝚖 𝚂𝚒𝚐𝚗𝚊𝚕 𝚂𝚌𝚘𝚛𝚎: {MIN_SIGNAL_SCORE}",
+            f"𝟷𝟹. 𝚂𝚞𝚙𝚙𝚘𝚛𝚝/𝚁𝚎𝚜𝚒𝚜𝚝𝚊𝚗𝚌𝚎 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if SUPPORT_RESISTANCE_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟺. 𝙼𝚘𝚟𝚒𝚗𝚐 𝙰𝚟𝚎𝚛𝚊𝚐𝚎 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if MOVING_AVERAGE_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟻. 𝚂𝚞𝚙𝚙𝚘𝚛𝚝/𝚁𝚎𝚜𝚒𝚜𝚝𝚊𝚗𝚌𝚎 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚒: {'✅ 𝙾𝙽' if SUPPORT_RESISTANCE_STRATEGY else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟼. 𝚂𝚑𝚘𝚠 𝙶𝚛𝚒𝚍 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if SHOW_GRID_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟽. 𝚂𝚑𝚘𝚠 𝙿𝚛𝚒𝚌𝚎 𝚂𝚌𝚊𝚕𝚎: {'✅ 𝙾𝙽' if SHOW_PRICE_SCALE else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟾. 𝚃𝚛𝚎𝚗𝚍 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if TREND_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟷𝟿. 𝙱𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝚃𝚛𝚊𝚗𝚜𝚙𝚊𝚛𝚎𝚗𝚌𝚢: {BACKGROUND_TRANSPARENCY}%",
+            f"𝟸𝟶. 𝙲𝚑𝚊𝚛𝚝 𝚃𝚎𝚡𝚝 𝙶𝚕𝚘𝚠: {CHART_TEXT_GLOW}%",
+            f"𝟸𝟷. 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔: {'✅ 𝙾𝙽' if WATERMARK_ON else '❌ 𝙾𝙵𝙵'}",
+            f"𝟸𝟸. 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔 𝚃𝚎𝚡𝚝: {WATERMARK_TEXT[:30]}...",
+            f"𝟸𝟹. 𝚂𝚒𝚐𝚗𝚊𝚕 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝: {SIGNAL_HEADER_TEXT[:30]}...",
+            f"𝟸𝟺. 𝙲𝚑𝚊𝚛𝚝 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝: {CHART_HEADER_TEXT[:30]}...",
+            f"𝟸𝟻. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙱𝚘𝚝 𝚃𝚘𝚔𝚎𝚗: {TELEGRAM_BOT_TOKEN[:15]}...",
+            f"𝟸𝟼. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙲𝚑𝚊𝚝 𝙸𝙳: {TELEGRAM_CHAT_ID}",
+            f"𝟸𝟽. 𝚂𝚒𝚐𝚗𝚊𝚕 𝚄𝚜𝚎𝚛𝚗𝚊𝚖𝚎: {SIGNAL_USERNAME}",
+            f"𝟸𝟾. 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼??𝚗: {SIGNAL_INTERVAL_MIN} 𝚜𝚎𝚌𝚘𝚗𝚍𝚜",
+            f"𝟸𝟿. 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼𝚊𝚡: {SIGNAL_INTERVAL_MAX} 𝚜𝚎𝚌𝚘𝚗𝚍𝚜",
+            f"𝟹𝟶. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙸𝙳: {TELEGRAM_API_ID}",
+            f"𝟹𝟷. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙷𝚊𝚜𝚑: {TELEGRAM_API_HASH[:10]}...",
+            f"𝟹𝟸. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙿𝚑𝚘𝚗𝚎 𝙽𝚞𝚖𝚋𝚎𝚛: {TELEGRAM_PHONE_NUMBER}",
+            f"𝟹𝟹. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚂𝚘𝚞𝚛𝚌𝚎 𝙲𝚑𝚊𝚗𝚗𝚎𝚕: {TELEGRAM_SOURCE_CHANNEL}",
+            f"𝟹𝟺. 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚃𝚊𝚛𝚐𝚎𝚝 𝙲𝚑𝚊𝚗𝚗𝚎𝚕𝚜: {TELEGRAM_TARGET_CHANNELS}",
+            f"𝟹𝟻. 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝙼𝚘𝚍𝚎: {'✅ 𝙾𝙽' if PREMIUM_EMOJI_MODE else '❌ 𝙾𝙵𝙵'}",
+            f"𝟹𝟼. 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝: {'✅ 𝙾𝙽' if PREMIUM_EMOJI_TARGET else '❌ 𝙾𝙵𝙵'}",
+            f"𝟹𝟽. 🌀 𝙿𝚊𝚛𝚊𝚋𝚘𝚕𝚒𝚌 𝚂𝙰𝚁 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if PARABOLIC_SAR_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟹𝟾. 📊 𝙶𝙰𝙿 𝙳𝚛𝚊𝚠𝚒𝚗𝚐: {'✅ 𝙾𝙽' if GAP_DRAWING else '❌ 𝙾𝙵𝙵'}",
+            f"𝟹𝟿. 🔄 𝚁𝚎𝚟𝚎𝚛𝚜𝚎 𝙰𝚛𝚎𝚊 𝙳𝚛𝚊𝚠𝚒𝚗𝚐: {'✅ 𝙾𝙽' if REVERSE_AREA_DRAWING else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟶. 📈 𝙰𝚍𝚟𝚊𝚗𝚌𝚎𝚍 𝙰𝚗𝚊𝚕𝚢𝚜𝚒𝚜: {'✅ 𝙾𝙽' if ADVANCED_ANALYSIS else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟷. 🔗 𝙲𝚞𝚜𝚝𝚘𝚖 𝙻𝚒𝚗𝚔: {CUSTOM_LINK[:30] if CUSTOM_LINK else '𝙽𝙾𝚃 𝚂𝙴𝚃'}",
+            f"𝟺𝟸. 🌀 𝙵𝚅𝙶 𝙶𝚊𝚙 𝙳𝚛𝚊𝚠: {'✅ 𝙾𝙽' if FVG_GAP_DRAW else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟹. 🔔 𝙱𝚘𝚝 𝙾𝙽/𝙾𝙵𝙵 𝙰𝚕𝚎𝚛𝚝: {'✅ 𝙾𝙽' if BOT_ALERT_ON else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟺. 🎨 𝙲𝚊𝚗𝚍𝚕𝚎 𝚄𝚙 𝙲𝚘𝚕𝚘𝚛: RGB{CANDLE_UP_COLOR}",
+            f"𝟺𝟻. 🎨 𝙲𝚊𝚗𝚍𝚕𝚎 𝙳𝚘𝚠𝚗 𝙲𝚘𝚕𝚘𝚛: RGB{CANDLE_DOWN_COLOR}",
+            f"𝟺𝟼. 📈 𝙴𝙼𝙰 𝙻𝚒𝚗𝚎 𝙲𝚑𝚊𝚛𝚝: {'✅ 𝙾𝙽' if EMA_LINE_CHART else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟽. 📊 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝙲𝚑𝚊𝚛𝚝: {'✅ 𝙾𝙽' if SUPERTREND_CHART else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟾. 🎯 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {'✅ 𝙾𝙽' if SUPERTREND_STRATEGY else '❌ 𝙾𝙵𝙵'}",
+            f"𝟺𝟿. 📐 𝚂𝙽𝚁 𝙻𝚒𝚗𝚎𝚜: {'✅ 𝙾𝙽' if SNR_LINES else '❌ 𝙾𝙵𝙵'}",
+            f"𝟻𝟶. 𝚂𝚎𝚗𝚍 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚁𝚎𝚜𝚞𝚕𝚝𝚜 𝙽𝚘𝚠",
+            f"𝟻𝟷. 𝙿𝙰𝚁𝚃𝙸𝙰𝙻 𝚁𝙴𝚂𝙴𝚃 (𝚁𝚎𝚜𝚎𝚝 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚃𝚛𝚊𝚍𝚎 𝙷𝚒𝚜𝚝𝚘𝚛𝚢)",
+            f"𝟻𝟸. 𝚂𝚊𝚟𝚎 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜",
+            f"𝟻𝟹. 𝙱𝚊𝚌𝚔 𝚝𝚘 𝙼𝚊𝚒𝚗 𝙼𝚎𝚗𝚞",
+            f"𝟻𝟺. 🏷️ 𝚁𝚎𝚜𝚞𝚕𝚝 𝙵𝚘𝚘𝚝𝚎𝚛 𝚃𝚎𝚡𝚝: {RESULT_FOOTER_TEXT[:22]}..."
+        ]
+        
+        for i, option in enumerate(options):
+            color = colors[i % len(colors)]
+            print(color + fancy_font(option))
+        
+        print("="*60)
+
+        choice = input(rainbow_text("𝙲𝚑𝚘𝚘𝚜𝚎 𝚘𝚙𝚝𝚒𝚘𝚗: ")).strip()
+
+        if choice == "1":
+            try:
+                steps = int(input(fancy_font("𝙴𝚗𝚝𝚎𝚛 𝚗𝚞𝚖𝚋𝚎𝚛 𝚘𝚏 𝚖𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎 𝚜𝚝𝚎𝚙𝚜 (𝟶-𝟹): ")))
+                if 0 <= steps <= 3: 
+                    MARTINGALE_STEPS = steps
+                    print(rainbow_text(f"✅ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎 𝚜𝚝𝚎𝚙𝚜 𝚜𝚎𝚝 𝚝𝚘 {steps}"))
+                else: 
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟶 𝚊𝚗𝚍 𝟹"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "2":
+            try:
+                interval = int(input(fancy_font("𝙴𝚗𝚝𝚎𝚛 𝚙𝚊𝚛𝚝𝚒𝚊𝚕 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚒𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝚒𝚗 𝚖𝚒𝚗𝚞𝚝𝚎𝚜 (𝟷-𝟼𝟶): ")))
+                if 1 <= interval <= 60: 
+                    PARTIAL_RESULTS_INTERVAL = interval * 60
+                    print(rainbow_text(f"✅ 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚒𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝚜𝚎𝚝 𝚝𝚘 {interval} 𝚖𝚒𝚗𝚞𝚝𝚎𝚜"))
+                else: 
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟷 𝚊𝚗𝚍 𝟼𝟶"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "3":
+            SEND_PHOTO_WITH_SIGNAL = not SEND_PHOTO_WITH_SIGNAL
+            new_mode = '𝙼𝚊𝚛𝚔𝚎𝚝 𝙲𝚑𝚊𝚛𝚝 𝙿𝚑𝚘𝚝𝚘' if SEND_PHOTO_WITH_SIGNAL else '𝚃𝚎𝚡𝚝 𝙾𝚗𝚕𝚢'
+            print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙿𝚑𝚘𝚝𝚘 𝙼𝚘𝚍𝚎 𝚒𝚜 𝚗𝚘𝚠 {new_mode}"))
+        elif choice == "4":
+            new_path = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚌𝚑𝚊𝚛𝚝 𝚋𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝚙𝚑𝚘𝚝𝚘 𝚙𝚊𝚝𝚑: ")).strip()
+            if new_path: 
+                CHART_BACKGROUND_IMAGE_PATH = new_path
+                print(rainbow_text(f"✅ 𝙲𝚑𝚊𝚛𝚝 𝙱𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝙿𝚑𝚘𝚝𝚘 𝚙𝚊𝚝𝚑 𝚜𝚎𝚝 𝚝𝚘: {CHART_BACKGROUND_IMAGE_PATH}"))
+            else: 
+                print(rainbow_text("⚠️ 𝙿𝚊𝚝𝚑 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "5":
+            ANALYZE_ALL_PAIRS = not ANALYZE_ALL_PAIRS
+            status = '𝙾𝙽' if ANALYZE_ALL_PAIRS else '𝙾𝙵𝙵 (𝙴𝚡𝚌𝚕𝚞𝚍𝚎 𝙻𝚒𝚜𝚝 𝙰𝚙𝚙𝚕𝚒𝚎𝚡)'
+            print(rainbow_text(f"✅ 𝙰𝚗𝚊𝚕𝚢𝚣𝚎 𝙰𝚕𝚕 𝙿𝚊𝚒𝚛𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "6":
+            CUSTOM_PAIRS_MODE = not CUSTOM_PAIRS_MODE
+            new_mode = '𝙲𝚄𝚂𝚃𝙾𝙼 𝙿𝙰𝙸𝚁𝚂 𝙾𝙽𝙻𝚈' if CUSTOM_PAIRS_MODE else '𝙰𝚄𝚃𝙾 𝙵𝙸𝙽𝙳 𝙿𝙰𝙸𝚁𝚂'
+            print(rainbow_text(f"✅ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛 𝙼𝚘𝚍𝚎 𝚒𝚜 𝚗𝚘𝚠 {new_mode}"))
+        elif choice == "7":
+            current_list_str = ", ".join(CUSTOM_PAIRS_LIST)
+            new_pairs_str = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚙𝚊𝚒𝚛𝚜 (𝚎.𝚐., 𝙱𝚁𝙻𝚄𝚂𝙳_𝚘𝚝𝚌,𝚄𝚂𝙳𝙿𝙺𝚁_𝚘𝚝𝚌) (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {current_list_str}): ")).strip()
+            if new_pairs_str:
+                new_list = [p.strip() for p in new_pairs_str.split(',') if p.strip()]
+                if new_list:
+                    CUSTOM_PAIRS_LIST = new_list
+                    print(rainbow_text(f"✅ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛𝚜 𝙻𝚒𝚜𝚝 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘: {', '.join(CUSTOM_PAIRS_LIST)}"))
+                else:
+                    print(rainbow_text("❌ 𝙸𝚗𝚙𝚞𝚝 𝚠𝚊𝚜 𝚎𝚖𝚙𝚝𝚢 𝚘𝚛 𝚘𝚗𝚕𝚢 𝚜𝚎𝚙𝚊𝚛𝚊𝚝𝚘𝚛𝚜."))
+            else:
+                print(rainbow_text("⚠️ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙿𝚊𝚒𝚛𝚜 𝙻𝚒𝚜𝚝 𝚗𝚘𝚛 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "8":
+            try:
+                period = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝙴𝙼𝙰 𝚙𝚎𝚛𝚒𝚘𝚍 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {EMA_PERIOD}): ")))
+                if period > 0: 
+                    EMA_PERIOD = period
+                    print(rainbow_text(f"✅ 𝙴𝙼𝙰 𝙿𝚎𝚛𝚒𝚘𝚍 𝚜𝚎𝚟 𝚝𝚘 {period}"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "9":
+            try:
+                period = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚁𝚂𝙸 𝚙𝚎𝚛𝚒𝚘𝚍 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {RSI_PERIOD}): ")))
+                if period > 0: 
+                    RSI_PERIOD = period
+                    print(rainbow_text(f"✅ 𝚁𝚂𝙸 𝙿𝚎𝚛𝚒𝚘𝚍 𝚜𝚎𝚝 𝚝𝚘 {period}"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "10":
+            print(rainbow_text("𝙰𝚟𝚊𝚒𝚕𝚊𝚋𝚕𝚎 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚒𝚎𝚜: " + ", ".join(AVAILABLE_STRATEGIES)))
+            new_strategy = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚜𝚝𝚛𝚊𝚝𝚎𝚐𝚢 𝚗𝚊𝚖𝚎 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CURRENT_STRATEGY}): ")).strip()
+            if new_strategy in AVAILABLE_STRATEGIES:
+                CURRENT_STRATEGY = new_strategy
+                print(rainbow_text(f"✅ 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢 𝚜𝚎𝚝 𝚝𝚘 {new_strategy}"))
+            else:
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚜𝚝𝚛𝚊𝚝𝚎𝚐𝚢"))
+        elif choice == "11":
+            MARK_RESULT_CANDLE = not MARK_RESULT_CANDLE
+            status = '𝙾𝙽' if MARK_RESULT_CANDLE else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙼𝚊𝚛𝚔 𝚁𝚎𝚜𝚞𝚕𝚝 𝙲𝚊𝚗𝚍𝚕𝚎 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "12":
+            try:
+                score = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚖𝚒𝚗𝚒𝚖𝚞𝚖 𝚜𝚒𝚐𝚗𝚊𝚕 𝚜𝚌𝚘𝚛𝚎 (𝟷-𝟻) (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {MIN_SIGNAL_SCORE}): ")))
+                if 1 <= score <= 5: 
+                    MIN_SIGNAL_SCORE = score
+                    print(rainbow_text(f"✅ 𝙼𝚒𝚗𝚒𝚖𝚞𝚖 𝚂𝚒𝚐𝚗𝚊𝚕 𝚂𝚌𝚘𝚛𝚎 𝚜𝚎𝚝 𝚝𝚘 {score}"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚟"))
+        elif choice == "13":
+            SUPPORT_RESISTANCE_LINES = not SUPPORT_RESISTANCE_LINES
+            status = '𝙾𝙽' if SUPPORT_RESISTANCE_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚞𝚙𝚙𝚘𝚛𝚝/𝚁𝚎𝚜𝚒𝚜𝚝𝚊𝚗𝚌𝚎 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "14":
+            MOVING_AVERAGE_LINES = not MOVING_AVERAGE_LINES
+            status = '𝙾𝙽' if MOVING_AVERAGE_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙼𝚘𝚟𝚒𝚗𝚐 𝙰𝚟𝚎𝚛𝚊𝚐𝚎 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "15":
+            SUPPORT_RESISTANCE_STRATEGY = not SUPPORT_RESISTANCE_STRATEGY
+            status = '𝙾𝙽' if SUPPORT_RESISTANCE_STRATEGY else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚞𝚙𝚙𝚘𝚛𝚝/𝚁𝚎𝚜𝚒𝚜𝚝𝚊𝚗𝚌𝚎 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "16":
+            SHOW_GRID_LINES = not SHOW_GRID_LINES
+            status = '𝙾𝙽' if SHOW_GRID_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚑𝚘𝚠 𝙶𝚛𝚒𝚍 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "17":
+            SHOW_PRICE_SCALE = not SHOW_PRICE_SCALE
+            status = '𝙾𝙽' if SHOW_PRICE_SCALE else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚑𝚘𝚠 𝙿𝚛𝚒𝚌𝚎 𝚂𝚌𝚊𝚕𝚎 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "18":
+            TREND_LINES = not TREND_LINES
+            status = '𝙾𝙽' if TREND_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚃𝚛𝚎𝚗𝚍 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "19":
+            try:
+                transparency = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚋𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝚝𝚛𝚊𝚗𝚜𝚙𝚊𝚛𝚎𝚗𝚌𝚢 (𝟶-𝟷𝟶𝟶)% (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {BACKGROUND_TRANSPARENCY}%): ")))
+                if 0 <= transparency <= 100:
+                    BACKGROUND_TRANSPARENCY = transparency
+                    print(rainbow_text(f"✅ 𝙱𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝚃𝚛𝚊𝚗𝚜𝚙𝚊𝚛𝚎𝚗𝚌𝚢 𝚜𝚎𝚝 𝚝𝚘 {transparency}%"))
+                else:
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟶 𝚊𝚗𝚍 𝟷𝟶𝟶"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "20":
+            try:
+                glow = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚌𝚑𝚊𝚛𝚝 𝚝𝚎𝚡𝚝 𝚐𝚕𝚘𝚠 (𝟶-𝟷𝟶𝟶)% (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CHART_TEXT_GLOW}%): ")))
+                if 0 <= glow <= 100:
+                    CHART_TEXT_GLOW = glow
+                    print(rainbow_text(f"✅ 𝙲𝚑𝚊𝚛𝚝 𝚃𝚎𝚡𝚝 𝙶𝚕𝚘𝚠 𝚜𝚎𝚝 𝚝𝚘 {glow}%"))
+                else:
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟶 𝚊𝚗𝚍 𝟷𝟶𝟶"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "21":
+            WATERMARK_ON = not WATERMARK_ON
+            status = '𝙾𝙽' if WATERMARK_ON else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "22":
+            new_text = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚠𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔 𝚝𝚎𝚡𝚝 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {WATERMARK_TEXT}): ")).strip()
+            if new_text:
+                WATERMARK_TEXT = new_text
+                print(rainbow_text(f"✅ 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔 𝚃𝚎𝚡𝚝 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘: {WATERMARK_TEXT}"))
+            else:
+                print(rainbow_text("⚠️ 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔 𝚃𝚎𝚡𝚝 𝚗𝚘𝚛 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "23":
+            new_text = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚜𝚒𝚐𝚗𝚊𝚕 𝚑𝚎𝚊𝚍𝚎𝚛 𝚝𝚎𝚡𝚝 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {SIGNAL_HEADER_TEXT}): ")).strip()
+            if new_text:
+                SIGNAL_HEADER_TEXT = new_text
+                print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘: {SIGNAL_HEADER_TEXT}"))
+            else:
+                print(rainbow_text("⚠️ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝 𝚗𝚘𝚛 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "24":
+            new_text = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚌𝚑𝚊𝚛𝚝 𝚑𝚎𝚊𝚍𝚎𝚛 𝚝𝚎𝚡𝚝 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CHART_HEADER_TEXT}): ")).strip()
+            if new_text:
+                CHART_HEADER_TEXT = new_text
+                print(rainbow_text(f"✅ 𝙲𝚑𝚊𝚛𝚝 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘: {CHART_HEADER_TEXT}"))
+            else:
+                print(rainbow_text("⚠️ 𝙲𝚑𝚊𝚛𝚟 𝙷𝚎𝚊𝚍𝚎𝚛 𝚃𝚎𝚡𝚝 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "25":
+            new_token = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙱𝚘𝚝 𝚃𝚘𝚔𝚎𝚗: ")).strip()
+            if new_token:
+                TELEGRAM_BOT_TOKEN = new_token
+                global bot
+                bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙱𝚘𝚝 𝚃𝚘𝚔𝚎𝚗 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            else:
+                print(rainbow_text("⚠️ 𝚃𝚘𝚔𝚎𝚗 𝚗𝚘𝚛 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "26":
+            new_chat_id = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙲𝚑𝚊𝚝 𝙸𝙳 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {TELEGRAM_CHAT_ID}): ")).strip()
+            if new_chat_id:
+                TELEGRAM_CHAT_ID = new_chat_id
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙲𝚑𝚊𝚝 𝙸𝙳 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            else:
+                print(rainbow_text("⚠️ 𝙲𝚑𝚊𝚝 𝙸𝙳 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "27":
+            new_username = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚂𝚒𝚐𝚗𝚊𝚕 𝚄𝚜𝚎𝚛𝚗𝚊𝚖𝚎 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {SIGNAL_USERNAME}): ")).strip()
+            if new_username:
+                SIGNAL_USERNAME = new_username
+                print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 𝚄𝚜𝚎𝚛𝚗𝚊𝚖𝚎 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘 {SIGNAL_USERNAME}"))
+            else:
+                print(rainbow_text("⚠️ 𝚄𝚜𝚎𝚛𝚗𝚊𝚖𝚎 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "28":
+            try:
+                new_min = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼𝚒𝚗 𝚒𝚗 𝚜𝚎𝚌𝚘𝚗𝚍𝚜 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {SIGNAL_INTERVAL_MIN}): ")))
+                if 60 <= new_min <= 1800:  # 1 minute to 30 minutes
+                    SIGNAL_INTERVAL_MIN = new_min
+                    print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼𝚒𝚗 𝚜𝚎𝚝 𝚝𝚘 {new_min} 𝚜𝚎𝚌𝚘𝚗𝚍𝚜"))
+                else:
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟼𝟶 𝚊𝚗𝚍 𝟷𝟾𝟶𝟶"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "29":
+            try:
+                new_max = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼𝚊𝚡 𝚒𝚗 𝚜𝚎𝚌𝚘𝚣𝚗𝚍𝚜 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {SIGNAL_INTERVAL_MAX}): ")))
+                if 60 <= new_max <= 1800 and new_max >= SIGNAL_INTERVAL_MIN:
+                    SIGNAL_INTERVAL_MAX = new_max
+                    print(rainbow_text(f"✅ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕 𝙼𝚊𝚡 𝚜𝚎𝚝 𝚝𝚘 {new_max} 𝚜𝚎𝚌𝚘𝚗𝚍𝚜"))
+                else:
+                    print(rainbow_text(f"❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙼𝚞𝚜𝚟 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 {SIGNAL_INTERVAL_MIN} 𝚊𝚗𝚍 𝟷𝟾𝟶𝟶"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "30":
+            try:
+                new_id = int(input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙸𝙳 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {TELEGRAM_API_ID}): ")))
+                TELEGRAM_API_ID = new_id
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙸𝙳 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            except: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝"))
+        elif choice == "31":
+            new_hash = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙷𝚊𝚜𝚑: ")).strip()
+            if new_hash:
+                TELEGRAM_API_HASH = new_hash
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙰𝙿𝙸 𝙷𝚊𝚜𝚑 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            else:
+                print(rainbow_text("⚠️ 𝙷𝚊𝚜𝚑 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "32":
+            new_phone = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙿𝚑𝚘𝚗𝚎 𝙽𝚞𝚖𝚋𝚎𝚛 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {TELEGRAM_PHONE_NUMBER}): ")).strip()
+            if new_phone:
+                TELEGRAM_PHONE_NUMBER = new_phone
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙿𝚑𝚘𝚗𝚎 𝙽𝚞𝚖𝚋𝚎𝚛 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            else:
+                print(rainbow_text("⚠️ 𝙿𝚑𝚘𝚗𝚎 𝚗𝚞𝚖𝚋𝚎𝚛 𝚗𝚘𝚛 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "33":
+            new_source = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚂𝚘𝚞𝚛𝚌𝚎 𝙲𝚑𝚊𝚗𝚗𝚎𝚕 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {TELEGRAM_SOURCE_CHANNEL}): ")).strip()
+            if new_source:
+                TELEGRAM_SOURCE_CHANNEL = new_source
+                print(rainbow_text("✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚂𝚘𝚞𝚛𝚌𝚎 𝙲𝚑𝚊𝚗𝚗𝚎𝚕 𝚞𝚙𝚍𝚊𝚝𝚎𝚍"))
+            else:
+                print(rainbow_text("⚠️ 𝚂𝚘𝚞𝚛𝚌𝚎 𝚌𝚑𝚊𝚗𝚗𝚎𝚕 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "34":
+            new_targets_str = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚃𝚊𝚛𝚐𝚎𝚝 𝙲𝚑𝚊𝚗𝚗𝚎𝚕𝚜 (𝚌𝚘𝚖𝚖𝚊 𝚜𝚎𝚙𝚊𝚛𝚊𝚝𝚎𝚍) (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {TELEGRAM_TARGET_CHANNELS}): ")).strip()
+            if new_targets_str:
+                try:
+                    new_targets = [int(x.strip()) for x in new_targets_str.split(',')]
+                    TELEGRAM_TARGET_CHANNELS = new_targets
+                    print(rainbow_text(f"✅ 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝚃𝚊𝚛𝚐𝚎𝚟 𝙲𝚑𝚊𝚗𝚗𝚎𝚕𝚜 𝚞𝚙𝚍𝚊𝚟𝚎𝚍 𝚝𝚘 {TELEGRAM_TARGET_CHANNELS}"))
+                except:
+                    print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚒𝚗𝚙𝚞𝚝. 𝙴𝚗𝚝𝚎𝚛 𝚌𝚘𝚖𝚖𝚊 𝚜𝚎𝚙𝚊𝚛𝚊𝚝𝚎𝚍 𝚌𝚑𝚊𝚗𝚗𝚎𝚕 𝙸𝙳𝚜.�"))
+            else:
+                print(rainbow_text("⚠️ 𝚃𝚊𝚛𝚐𝚎𝚟 𝚌𝚑𝚊𝚗𝚗𝚎𝚕𝚜 𝚗𝚘𝚝 𝚌𝚑𝚊𝚗𝚐𝚎𝚍."))
+        elif choice == "35":
+            PREMIUM_EMOJI_MODE = not PREMIUM_EMOJI_MODE
+            status = '𝙾𝙽' if PREMIUM_EMOJI_MODE else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝙼𝚘𝚍𝚎 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "36":
+            PREMIUM_EMOJI_TARGET = not PREMIUM_EMOJI_TARGET
+            status = '𝙾𝙽' if PREMIUM_EMOJI_TARGET else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒 𝚃𝚊𝚛𝚐𝚎𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "37":
+            PARABOLIC_SAR_LINES = not PARABOLIC_SAR_LINES
+            status = '𝙾𝙽' if PARABOLIC_SAR_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙿𝚊𝚛𝚊𝚋𝚘𝚕𝚒𝚌 𝚂𝙰𝚁 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "38":
+            GAP_DRAWING = not GAP_DRAWING
+            status = '𝙾𝙽' if GAP_DRAWING else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙶𝙰𝙿 𝙳𝚛𝚊𝚠𝚒𝚗𝚐 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "39":
+            REVERSE_AREA_DRAWING = not REVERSE_AREA_DRAWING
+            status = '𝙾𝙽' if REVERSE_AREA_DRAWING else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚁𝚎𝚟𝚎𝚛𝚜𝚎 𝙰𝚛𝚎𝚊 𝙳𝚛𝚊𝚠𝚒𝚗𝚐 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "40":
+            ADVANCED_ANALYSIS = not ADVANCED_ANALYSIS
+            status = '𝙾𝙽' if ADVANCED_ANALYSIS else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙰𝚍𝚟𝚊𝚗𝚌𝚎𝚍 𝙰𝚗𝚊𝚕𝚢𝚜𝚒𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "41":
+            new_link = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚗𝚎𝚠 𝙲𝚞𝚜𝚝𝚘𝚖 𝙻𝚒𝚗𝚔 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CUSTOM_LINK}): ")).strip()
+            if new_link:
+                CUSTOM_LINK = new_link
+                print(rainbow_text(f"✅ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙻𝚒𝚗𝚔 𝚞𝚙𝚍𝚊𝚝𝚎𝚍 𝚝𝚘: {CUSTOM_LINK}"))
+            else:
+                CUSTOM_LINK = ""
+                print(rainbow_text("✅ 𝙲𝚞𝚜𝚝𝚘𝚖 𝙻𝚒𝚗𝚔 𝚌𝚕𝚎𝚊𝚛𝚎𝚍"))
+        elif choice == "42":
+            FVG_GAP_DRAW = not FVG_GAP_DRAW
+            status = '𝙾𝙽' if FVG_GAP_DRAW else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙵𝚅𝙶 𝙶𝚊𝚙 𝙳𝚛𝚊𝚠 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "43":
+            BOT_ALERT_ON = not BOT_ALERT_ON
+            status = '𝙾𝙽' if BOT_ALERT_ON else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙱𝚘𝚝 𝙾𝙽/𝙾𝙵𝙵 𝙰𝚕𝚎𝚛𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "44":
+            try:
+                color_input = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝚄𝚙 𝙲𝚊𝚗𝚍𝚕𝚎 𝙲𝚘𝚕𝚘𝚛 𝚊𝚜 𝚁,𝙶,𝙱 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CANDLE_UP_COLOR}): ")).strip()
+                if color_input:
+                    r, g, b = map(int, color_input.split(','))
+                    if 0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255:
+                        CANDLE_UP_COLOR = (r, g, b)
+                        print(rainbow_text(f"✅ 𝚄𝚙 𝙲𝚊𝚗𝚍𝚕𝚎 𝙲𝚘𝚕𝚘𝚛 𝚜𝚎𝚝 𝚝𝚘 RGB({r},{g},{b})"))
+                    else:
+                        print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚌𝚘𝚕𝚘𝚛 𝚟𝚊𝚕𝚞𝚎𝚜. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟶 𝚊𝚗𝚍 𝟸𝟻𝟻"))
+            except:
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚏𝚘𝚛𝚖𝚊𝚝. 𝚄𝚜𝚎 𝚏𝚘𝚛𝚖𝚊𝚝: 𝚁,𝙶,𝙱"))
+        elif choice == "45":
+            try:
+                color_input = input(fancy_font(f"𝙴𝚗𝚝𝚎𝚛 𝙳𝚘𝚠𝚗 𝙲𝚊𝚗𝚍𝚕𝚎 𝙲𝚘𝚕𝚘𝚛 𝚊𝚜 𝚁,𝙶,𝙱 (𝙲𝚞𝚛𝚛𝚎𝚗𝚝: {CANDLE_DOWN_COLOR}): ")).strip()
+                if color_input:
+                    r, g, b = map(int, color_input.split(','))
+                    if 0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255:
+                        CANDLE_DOWN_COLOR = (r, g, b)
+                        print(rainbow_text(f"✅ 𝙳𝚘𝚠𝚗 𝙲𝚊𝚗𝚍𝚕𝚎 𝙲𝚘𝚕𝚘𝚛 𝚜𝚎𝚝 𝚝𝚘 RGB({r},{g},{b})"))
+                    else:
+                        print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚌𝚘𝚕𝚘𝚛 𝚟𝚊𝚕𝚞𝚎𝚜. 𝙼𝚞𝚜𝚝 𝚋𝚎 𝚋𝚎𝚝𝚠𝚎𝚎𝚗 𝟶 𝚊𝚗𝚍 𝟸𝟻𝟻"))
+            except:
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚏𝚘𝚛𝚖𝚊𝚝. 𝚄𝚜𝚎 𝚏𝚘𝚛𝚖𝚊𝚝: 𝚁,𝙶,𝙱"))
+        elif choice == "46":
+            EMA_LINE_CHART = not EMA_LINE_CHART
+            status = '𝙾𝙽' if EMA_LINE_CHART else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝙴𝙼𝙰 𝙻𝚒𝚗𝚎 𝙲𝚑𝚊𝚛𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "47":
+            SUPERTREND_CHART = not SUPERTREND_CHART
+            status = '𝙾𝙽' if SUPERTREND_CHART else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝙲𝚑𝚊𝚛𝚝 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "48":
+            SUPERTREND_STRATEGY = not SUPERTREND_STRATEGY
+            status = '𝙾𝙽' if SUPERTREND_STRATEGY else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "49":
+            SNR_LINES = not SNR_LINES
+            status = '𝙾𝙽' if SNR_LINES else '𝙾𝙵𝙵'
+            print(rainbow_text(f"✅ 𝚂𝙽𝚁 𝙻𝚒𝚗𝚎𝚜 𝚒𝚜 𝚗𝚘𝚠 {status}"))
+        elif choice == "50":
+            send_partial_results()
+            print(rainbow_text("✅ 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚜𝚎𝚗𝚝"))
+        elif choice == "51":
+            # --- PARTIAL RESET লজিক ---
+            confirm = input(rainbow_text("⚠️ 𝙰𝚛𝚎 𝚢𝚘𝚞 𝚜𝚞𝚛𝚎 𝚢𝚘𝚞 𝚠𝚊𝚗𝚝 𝚝𝚘 𝚛𝚎𝚜𝚎𝚝 𝙰𝙻𝙻 𝚘𝚏 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜? (𝚢𝚎𝚜/𝚗𝚘): ")).lower()
+            if confirm == 'yes':
+                global trade_results
+                today_date_str = datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()
+                
+                # আজকের রেজাল্টগুলো বাদ দিয়ে বাকিগুলো রাখা হবে
+                trade_results = [r for r in trade_results if r.get('date') != today_date_str]
+                
+                save_trade_results()
+                print(rainbow_text("✅ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚑𝚊𝚟𝚎 𝚋𝚎𝚎𝚗 𝚛𝚎𝚜𝚎𝚝."))
+            else:
+                print(rainbow_text("⚠️ 𝚁𝚎𝚜𝚎𝚝 𝚌𝚊𝚗𝚌𝚎𝚕𝚕𝚎𝚍."))
+        elif choice == "52":
+            save_trade_results()
+            print(rainbow_text("✅ 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜 𝚊𝚗𝚍 𝚝𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚜𝚊𝚟𝚎𝚍"))
+        elif choice == "53":
+            clear_screen()
+            break
+        elif choice == "54":
+            print(rainbow_text(f"\U0001f3f7\ufe0f Current Footer: {RESULT_FOOTER_TEXT}"))
+            raw_input = input(fancy_font(
+                "\U0001f4dd Enter word to auto-format (e.g. NAGIIP)\n"
+                "   or type full text to use as-is: "
+            )).strip()
+            if raw_input:
+                # Auto-format: if plain word (no spaces/special chars) wrap in mafia style
+                import re as _re
+                if _re.match(r"^[A-Za-z0-9]+$", raw_input):
+                    letters = " | ".join(list(raw_input.upper()))
+                    RESULT_FOOTER_TEXT = f"\U00012194\u2022\u2014\u2014\u203c\ufe0f {letters} \u203c\ufe0f\u2014\u2014\u2022\U00012194"
+                else:
+                    RESULT_FOOTER_TEXT = raw_input
+                print(rainbow_text(f"\u2705 Footer updated: {RESULT_FOOTER_TEXT}"))
+            else:
+                print(rainbow_text("\u26a0\ufe0f No changes made."))
+        else:
+            print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚘𝚙𝚝𝚒𝚘𝚗"))
+        
+        input(rainbow_text("\n𝙿𝚛𝚎𝚜𝚜 𝙴𝚗𝚝𝚎𝚛 𝚝𝚘 𝚌𝚘𝚗𝚝𝚒𝚗𝚞𝚎..."))
+        clear_screen()
+
+# ================= প্রধান মেনু (RAINBOW UI) =================
+
+def main_menu():
+    # এখন মেইন মেনু লোড করুন
+    load_trade_results()
+
+    while True:
+        try:
+            clear_screen()
+            print("\n" + "="*60)
+            print(rainbow_text("🤖 NAGIIP DOLLAR 𝐱 𝐀𝙸 𝐁𝐎𝐓 - 𝙿𝚛𝚘𝚏𝚎𝚜𝚜𝚒𝚘𝚗𝚊𝚕 𝚃𝚛𝚊𝚍𝚒𝚗𝚐 𝚂𝚢𝚜𝚝𝚎𝚖"))
+            print("="*60)
+
+            # Only confirmed trades count for stats
+            confirmed_trades = [r for r in trade_results if r.get('result') in ['Profit', 'Loss']]
+            today_trades = [r for r in confirmed_trades if r.get('date') == datetime.now(pytz.timezone('Asia/Dhaka')).date().isoformat()]
+            today_stats = get_statistics(today_trades)
+
+            # রেইনবো কালারে স্ট্যাটিস্টিক্স
+            colors = [Fore.RED, Fore.YELLOW, Fore.GREEN, Fore.CYAN, Fore.BLUE, Fore.MAGENTA]
+            
+            stats = [
+                f"📊 𝚃𝚘𝚝𝚊𝚕 𝚂𝚒𝚐𝚗𝚊𝚕𝚜 (𝙲𝚘𝚗𝚏𝚒𝚛𝚖𝚎𝚍): {len(confirmed_trades)}",
+                f"📈 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚃𝚛𝚊𝚍𝚎𝚜 (𝙲𝚘𝚗𝚏𝚒𝚛𝚖𝚎𝚍): {today_stats['total_trades']}",
+                f"✅ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝚆𝚒𝚗𝚜: {today_stats['wins']}",
+                f"❌ 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙻𝚘𝚜𝚜𝚎𝚜: {today_stats['losses']}",
+                f"📊 𝚃𝚘𝚍𝚊𝚢'𝚜 𝙰𝚌𝚌𝚞𝚛𝚊𝚌𝚢: {today_stats['accuracy']}%",
+                f"⚙️ 𝙼𝚊𝚛𝚝𝚒𝚗𝚐𝚊𝚕𝚎: {MARTINGALE_STEPS} 𝚜𝚝𝚎𝚙(𝚜)",
+                f"🖼️ 𝙿𝚑𝚘𝚝𝚘 𝚂𝚎𝚗𝚍: {'𝙼𝚊𝚛𝚔𝚎𝚝 𝙲𝚑𝚊𝚛𝚝' if SEND_PHOTO_WITH_SIGNAL else '𝚃𝚎𝚡𝚝 𝙾𝚗𝚕𝚢'}",
+                f"🌐 𝙿𝚊𝚒𝚛 𝙼𝚘𝚍𝚎: {'𝙲𝚄𝚂𝚃𝙾𝙼 𝙿𝙰𝙸𝚁𝚂 𝙾𝙽𝙻𝚈' if CUSTOM_PAIRS_MODE else ('𝙰𝙻𝙻 𝙿𝙰𝙸𝚁𝚂' if ANALYZE_ALL_PAIRS else '𝙴𝚇𝙲𝙻𝚄𝙳𝙴 𝙾𝚃𝙲 𝙻𝙸𝚂𝚃')}",
+                f"🎯 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {CURRENT_STRATEGY}",
+                f"🌀 𝙿𝚊𝚛𝚊𝚋𝚘𝚕𝚒𝚌 𝚂𝙰𝚁�: {'𝙾𝙽' if PARABOLIC_SAR_LINES else '𝙾𝙵𝙵'}",
+                f"📊 𝙶𝙰𝙿 𝙳𝚛𝚊𝚠𝚒𝚗𝚐: {'𝙾𝙽' if GAP_DRAWING else '𝙾𝙵𝙵'}",
+                f"🌀 𝙵𝚅𝙶 𝙶𝚊𝚙 𝙳𝚛𝚊𝚠: {'𝙾𝙽' if FVG_GAP_DRAW else '𝙾𝙵𝙵'}",
+                f"🔄 𝚁𝚎𝚟𝚎𝚛𝚜𝚎 𝙰𝚛𝚎𝚊: {'𝙾𝙽' if REVERSE_AREA_DRAWING else '𝙾𝙵𝙵'}",
+                f"📈 𝙰𝚍𝚟𝚊𝚗𝚌𝚎𝚍 𝙰𝚗𝚊𝚕𝚢𝚜𝚒𝚜: {'𝙾𝙽' if ADVANCED_ANALYSIS else '𝙾𝙵𝙵'}",
+                f"🎨 𝙲𝚞𝚜𝚝𝚘𝚖 𝙲𝚊𝚗𝚍𝚕𝚎 𝙲𝚘𝚕𝚘𝚛𝚜: {'𝙾𝙽' if CANDLE_UP_COLOR != (0, 200, 0) or CANDLE_DOWN_COLOR != (255, 50, 50) else '𝙾𝙵𝙵'}",
+                f"📈 𝙴𝙼𝙰 𝙻𝚒𝚗𝚎 𝙲𝚑𝚊𝚛𝚝: {'𝙾𝙽' if EMA_LINE_CHART else '𝙾𝙵𝙵'}",
+                f"📊 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝙲𝚑𝚊𝚛𝚝: {'𝙾𝙽' if SUPERTREND_CHART else '𝙾𝙵𝙵'}",
+                f"🎯 𝚂𝚞𝚙𝚎𝚛𝚝𝚛𝚎𝚗𝚍 𝚂𝚝𝚛𝚊𝚝𝚎𝚐𝚢: {'𝙾𝙽' if SUPERTREND_STRATEGY else '𝙾𝙵𝙵'}",
+                f"📐 𝚂𝙽𝚁 𝙻𝚒𝚗𝚎𝚜: {'𝙾𝙽' if SNR_LINES else '𝙾𝙵𝙵'}",
+                f"🔔 𝙱𝚘𝚝 𝙰𝚕𝚎𝚛𝚝: {'𝙾𝙽' if BOT_ALERT_ON else '𝙾𝙵𝙵'}",
+                f"🔗 𝙲𝚞𝚜𝚝𝚘𝚖 𝙻𝚒𝚗𝚔: {'𝚂𝙴𝚃' if CUSTOM_LINK else '𝙽𝙾𝚃 𝚂𝙴𝚃'}",
+                f"📱 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖 𝙼𝚘𝚍𝚎: {'𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙴𝚖𝚘𝚓𝚒' if PREMIUM_EMOJI_MODE else '𝚁𝚎𝚐𝚞𝚕𝚊𝚛'}",
+                f"🎯 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝚃𝚊𝚛𝚐𝚎𝚝: {'𝙾𝙽' if PREMIUM_EMOJI_TARGET else '𝙾𝙵𝙵'}",
+                f"⏱️ 𝚂𝚒𝚐𝚗𝚊𝚕 𝙸𝚗𝚝𝚎𝚛𝚟𝚊𝚕: {SIGNAL_INTERVAL_MIN//60}-{SIGNAL_INTERVAL_MAX//60} 𝚖𝚒𝚗𝚜",
+                f"📈 𝚃𝚛𝚎𝚗𝚍 𝙻𝚒𝚗𝚎𝚜: {'𝙾𝙽' if TREND_LINES else '𝙾𝙵𝙵'}",
+                f"🎨 𝙱𝚊𝚌𝚔𝚐𝚛𝚘𝚞𝚗𝚍 𝚃𝚛𝚊𝚗𝚜𝚙𝚊𝚛𝚎𝚗𝚌𝚢: {BACKGROUND_TRANSPARENCY}%",
+                f"✨ 𝙲𝚑𝚊𝚛𝚝 𝚃𝚎𝚡𝚝 𝙶𝚕𝚘𝚠: {CHART_TEXT_GLOW}%",
+                f"💧 𝚆𝚊𝚝𝚎𝚛𝚖𝚊𝚛𝚔: {'𝙾𝙽' if WATERMARK_ON else '𝙾??𝙵'}",
+                f"📝 𝚂𝚒𝚐𝚗𝚊𝚕 𝙷𝚎𝚊𝚍𝚎𝚛: {SIGNAL_HEADER_TEXT[:20]}..."
+            ]
+            
+            for i, stat in enumerate(stats):
+                color = colors[i % len(colors)]
+                print(color + fancy_font(stat))
+            
+            print("="*60)
+
+            # রেইনবো কালারে মেনু অপশন
+            menu_options = []
+            if not bot_running: 
+                menu_options.append(f"𝟷. ▶️ 𝚂𝚝𝚊𝚛𝚝 𝙱𝚘𝚝")
+            
+            menu_options.extend([
+                f"𝟸. 📊 𝚂𝚎𝚗𝚍 𝙼𝚊𝚗𝚞𝚊𝚕 𝚃𝚛𝚊𝚍𝚎 𝚁𝚎𝚜𝚞𝚕𝚝",
+                f"𝟹. 📤 𝚂𝚎𝚗𝚍 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚁𝚎𝚜𝚞𝚕𝚝𝚜 𝙽𝚘𝚠 (𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖)",
+                f"𝟺. ⚙️ 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜"
+            ])
+            
+            if bot_running: 
+                menu_options.append(f"𝟻. ⏹️ 𝚂𝚝𝚘𝚙 𝙱𝚘𝚝")
+            
+            menu_options.append(f"𝟼. 🚪 𝙴𝚡𝚒𝚝")
+            
+            for i, option in enumerate(menu_options):
+                color = colors[i % len(colors)]
+                print(color + fancy_font(option))
+            
+            print("="*60)
+
+            choice = input(rainbow_text("𝙲𝚑𝚘𝚘𝚜𝚎 𝚘𝚙𝚝𝚒𝚘𝚗: ")).strip()
+
+            if choice == "1" and not bot_running: 
+                ensure_telegram_auth()
+                start_bot()
+            elif choice == "2": 
+                send_manual_result()
+            elif choice == "3": 
+                send_partial_results()
+                print(rainbow_text("✅ 𝙿𝚊𝚛𝚝𝚒𝚊𝚕 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚜𝚎𝚗𝚝 𝚝𝚘 𝚃𝚎𝚕𝚎𝚐𝚛𝚊𝚖!"))
+            elif choice == "4": 
+                settings_menu()
+            elif choice == "5" and bot_running: 
+                stop_bot()
+            elif choice == "6": 
+                stop_bot()
+                save_trade_results()
+                print(rainbow_text("👋 𝙶𝚘𝚘𝚍𝚋𝚢𝚎! 𝚃𝚛𝚊𝚍𝚎 𝚛𝚎𝚜𝚞𝚕𝚝𝚜 𝚜𝚊𝚟𝚎𝚍 𝚝𝚘 NAGIIP DOLLAR.𝚓𝚜𝚘𝚗"))
+                break
+            else: 
+                print(rainbow_text("❌ 𝙸𝚗𝚟𝚊𝚕𝚒𝚍 𝚘𝚙𝚝𝚒𝚘𝚗"))
+            
+            input(rainbow_text("\n𝙿𝚛𝚎𝚜𝚜 𝙴𝚗𝚝𝚎𝚛 𝚝𝚘 𝚌𝚘𝚗𝚝𝚒𝚗𝚞𝚎..."))
+            
+        except EOFError: 
+            stop_bot()
+            save_trade_results()
+            break
+        except KeyboardInterrupt: 
+            stop_bot()
+            save_trade_results()
+            break
+        except Exception as e: 
+            print(rainbow_text(f"𝙴𝚛𝚛𝚘𝚛 𝚒𝚗 𝚖𝚎𝚗𝚞: {e}"))
+            continue
+
+def _run_headless():
+    """
+    Headless / deploy mode:
+    - No terminal interaction required.
+    - Starts the Telegram command bot (blocking, keeps the process alive).
+    - You control everything via /menu in Telegram.
+    - The trading bot itself is started from Telegram using the Start Bot button.
+    """
+    if sys.platform == "win32":
+        os.system("chcp 65001 > nul")
+
+    load_trade_results()
+
+    print(rainbow_text("="*60))
+    print(rainbow_text("  NAGIIP DOLLAR x AI BOT  |  DEPLOY MODE"))
+    print(rainbow_text("="*60))
+    print(rainbow_text(f"  Admin ID : {ADMIN_TELEGRAM_USER_ID}"))
+    print(rainbow_text("  Send /menu to your Telegram bot to control it."))
+    print(rainbow_text("="*60))
+
+    # Run Telegram command bot in foreground with auto-restart.
+    # If polling crashes for any reason, wait 5 s and retry — process never exits.
+    import time as _time
+    _retry_delay = 5
+    while True:
+        run_telegram_command_bot()
+        print(rainbow_text(f"🔄 Bot stopped — restarting in {_retry_delay}s..."))
+        _time.sleep(_retry_delay)
+
+
+if __name__ == "__main__":
+    try:
+        # UTF-8 encoding
+        if sys.platform == "win32":
+            os.system("chcp 65001 > nul")
+
+        # ── DEPLOY / HEADLESS MODE ──────────────────────────────────────
+        # Detected when: running with --deploy flag OR no interactive terminal
+        # (e.g. running on a VPS, Replit, Railway, Render, etc.)
+        _deploy_mode = "--deploy" in sys.argv or not sys.stdin.isatty()
+
+        if _deploy_mode:
+            _run_headless()
+        else:
+            # ── INTERACTIVE / TERMINAL MODE ─────────────────────────────
+            clear_screen()
+            print(rainbow_text("="*70))
+            print(rainbow_text("     NAGIIP DOLLAR x AI BOT - Professional Trading System"))
+            print(rainbow_text("              Version 8.0 - Complete Features Update"))
+            print(rainbow_text("="*70))
+
+            # Start Telegram command bot in background so it works alongside terminal
+            start_telegram_command_bot(daemon=True)
+            print(rainbow_text("📱 Telegram bot active — send /menu to control from Telegram too."))
+
+            main_menu()
+
+    except Exception as e:
+        print(rainbow_text(f"A critical error occurred: {e}"))
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
